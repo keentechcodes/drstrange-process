@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data files (large PDFs stored separately)
+*.pdf
+
+# Generated outputs (keep README and docs)
+*.toc.json
+*.meta.json
+*.pageblocks.json
+results/
+images/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
