@@ -6,14 +6,23 @@
 #   ./setup_runpod.sh
 #
 # This sets up:
-#   - uv (Python package manager with PEP 723 support)
-#   - Basic terminal tools (tmux, btop, nvtop)
-#   - Pre-caches Python dependencies for all scripts
+#   - System packages (apt update/upgrade, terminal tools, poppler, pandoc)
+#   - uv (Python package manager)
+#   - Python venv with all pipeline dependencies (docstrange, torch, etc.)
+#   - Pre-downloads Nanonets-OCR2-3B model (~6 GB)
+#
+# After setup, activate the venv and run any script with plain `python`:
+#   source .venv/bin/activate
+#   python extract_toc.py BATES.pdf
+#   python run_docstrange_textbook.py BATES.pdf results/textbook
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+VENV_DIR="$SCRIPT_DIR/.venv"
+OCR_MODEL="nanonets/Nanonets-OCR2-3B"
 
 echo "============================================================"
 echo "  RunPod Setup - drstrange-process"
@@ -25,9 +34,9 @@ echo "[setup] Updating system packages..."
 apt-get update -qq
 apt-get upgrade -y -qq 2>&1 | tail -3
 
-# 2. Terminal tools
-echo "[setup] Installing terminal tools..."
-apt-get install -y -qq tmux btop nvtop 2>&1 | tail -3
+# 2. Terminal tools + docstrange system deps
+echo "[setup] Installing system dependencies..."
+apt-get install -y -qq tmux btop nvtop poppler-utils pandoc 2>&1 | tail -3
 
 # 3. Install uv if not present
 if ! command -v uv &> /dev/null; then
@@ -54,63 +63,95 @@ if command -v nvidia-smi &> /dev/null; then
     echo "  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null)"
 fi
 
-# 5. Pre-cache Python dependencies for each script
+# ============================================================
+# 5. Create Python venv with all pipeline dependencies
+# ============================================================
 echo ""
-echo "[setup] Pre-caching Python dependencies..."
+echo "============================================================"
+echo "  Creating Python environment"
+echo "============================================================"
 
-# Cache deps for all scripts with PEP 723 inline metadata
-for script in extract_toc.py; do
-    if [ -f "$script" ]; then
-        echo "[setup]   Caching deps for $script..."
-        uv run "$script" --help > /dev/null 2>&1 || true
+if [ -d "$VENV_DIR" ] && "$VENV_DIR/bin/python" -c "import docstrange; import torch" 2>/dev/null; then
+    echo "[venv] Venv already exists and looks good"
+else
+    echo "[venv] Creating venv at $VENV_DIR"
+    rm -rf "$VENV_DIR"
+    uv venv "$VENV_DIR" --python 3.11
+
+    # Install torch first (needed by docstrange and flash-attn)
+    echo "[venv] Installing torch..."
+    uv pip install --python "$VENV_DIR/bin/python" \
+        "torch>=2.0.0" \
+        "torchvision>=0.15.0"
+
+    # Install docstrange + all pipeline dependencies
+    echo "[venv] Installing docstrange and pipeline dependencies..."
+    uv pip install --python "$VENV_DIR/bin/python" \
+        "docstrange>=1.1.0" \
+        "pdf2image>=1.17.0" \
+        "Pillow>=10.0.0" \
+        "pymupdf>=1.24.0" \
+        "huggingface_hub>=0.20.0"
+
+    # flash-attn for faster inference (~15-20% speedup)
+    # Requires torch to be installed first; needs --no-build-isolation
+    if command -v nvidia-smi &> /dev/null; then
+        echo "[venv] Building flash-attn (this takes 5-15 minutes)..."
+        uv pip install --python "$VENV_DIR/bin/python" setuptools wheel
+        if uv pip install --python "$VENV_DIR/bin/python" \
+            "flash-attn>=2.7.3" --no-build-isolation 2>&1 | tail -10; then
+            echo "[venv] flash-attn installed!"
+        else
+            echo "[venv] WARNING: flash-attn build failed. Will fall back to SDPA attention."
+        fi
     fi
-done
-# Note: run_docstrange_textbook.py requires a pre-built venv with docstrange,
-# torch, and transformers.  It cannot be run via 'uv run' standalone.
-echo "[setup]   Skipping run_docstrange_textbook.py (requires GPU venv with docstrange)"
 
+    # Verify installation
+    echo "[venv] Verifying..."
+    "$VENV_DIR/bin/python" -c "
+import docstrange
+print(f'  docstrange: OK')
+import torch
+print(f'  torch: {torch.__version__} (CUDA: {torch.cuda.is_available()})')
+import fitz
+print(f'  pymupdf: {fitz.version}')
+try:
+    import flash_attn
+    print(f'  flash-attn: {flash_attn.__version__}')
+except ImportError:
+    print('  flash-attn: NOT INSTALLED (will use SDPA)')
+"
+fi
+
+# ============================================================
 # 6. Pre-download Nanonets-OCR2-3B model (~6 GB)
-# This avoids a long first-run download when processing PDFs.
-OCR_MODEL="nanonets/Nanonets-OCR2-3B"
+# ============================================================
 echo ""
 echo "[setup] Pre-downloading OCR model: $OCR_MODEL"
 
-if python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
-    python3 -c "
+"$VENV_DIR/bin/python" -c "
 from huggingface_hub import snapshot_download
 print('[setup]   Downloading ${OCR_MODEL} (this may take a few minutes)...')
 path = snapshot_download('${OCR_MODEL}')
 print(f'[setup]   Model cached at: {path}')
 " && echo "[setup]   Model download complete." \
   || echo "[setup]   WARNING: Model download failed. It will be downloaded on first run."
-else
-    echo "[setup]   huggingface_hub not installed, trying pip install..."
-    pip install -q huggingface_hub 2>/dev/null && \
-    python3 -c "
-from huggingface_hub import snapshot_download
-print('[setup]   Downloading ${OCR_MODEL} (this may take a few minutes)...')
-path = snapshot_download('${OCR_MODEL}')
-print(f'[setup]   Model cached at: {path}')
-" && echo "[setup]   Model download complete." \
-  || echo "[setup]   WARNING: Model download failed. It will be downloaded on first run."
-fi
 
-# 7. Pre-download flash-attn if GPU is available (for faster inference)
-if command -v nvidia-smi &> /dev/null; then
-    echo ""
-    echo "[setup] Installing flash-attn for faster inference..."
-    pip install -q flash-attn --no-build-isolation 2>&1 | tail -3 \
-        && echo "[setup]   flash-attn installed." \
-        || echo "[setup]   WARNING: flash-attn install failed. Will fall back to SDPA attention."
-fi
-
+# ============================================================
+# Summary
+# ============================================================
 echo ""
 echo "============================================================"
 echo "  Setup Complete!"
 echo "============================================================"
 echo ""
-echo "  Available scripts:"
-echo "    uv run extract_toc.py <pdf>     - Extract TOC from PDF"
+echo "  Activate the environment:"
+echo "    source .venv/bin/activate"
+echo ""
+echo "  Then run any script with python:"
+echo "    python extract_toc.py BATES.pdf"
+echo "    python run_docstrange_textbook.py BATES.pdf results/textbook"
+echo "    python run_docstrange_textbook.py BATES_sample_306-324.pdf results/sample --safe"
 echo ""
 echo "  Pre-cached models:"
 echo "    $OCR_MODEL (Nanonets OCR2, Qwen2.5-VL-3B fine-tune)"
