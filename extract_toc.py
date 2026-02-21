@@ -63,7 +63,16 @@ def parse_chapter_num(title: str) -> int | None:
     return None
 
 
-def detect_page_offset(toc: list[list], anchors: dict[str, int]) -> int:
+def detect_page_offset(toc: list[tuple[int, str, int]], anchors: dict[str, int]) -> int:
+    """Detect the page offset by matching TOC entries against known anchors.
+
+    Collects offsets from all matching anchors and returns the most common
+    (mode) to guard against a single mislabeled TOC entry skewing the result.
+    Returns 0 if no anchors match.
+    """
+    from collections import Counter
+
+    offsets: list[int] = []
     for entry in toc:
         level, title, pdf_page = entry[0], entry[1], entry[2]
         if level != 1:
@@ -74,11 +83,27 @@ def detect_page_offset(toc: list[list], anchors: dict[str, int]) -> int:
                 anchor_title.lower() in clean_title.lower()
                 or clean_title.lower() in anchor_title.lower()
             ):
-                return pdf_page - book_page
-    return 0
+                offsets.append(pdf_page - book_page)
+                break  # one match per TOC entry is enough
+
+    if not offsets:
+        return 0
+
+    # Return the most common offset (mode); if there's a tie, pick the first
+    offset_counts = Counter(offsets)
+    best_offset, count = offset_counts.most_common(1)[0]
+    if count < len(offsets):
+        mismatches = [(o, c) for o, c in offset_counts.items() if o != best_offset]
+        print(
+            f"[toc] WARNING: inconsistent offsets detected. "
+            f"Using {best_offset} ({count}/{len(offsets)} matches). "
+            f"Outliers: {mismatches}"
+        )
+    return best_offset
 
 
 def classify_entry(book_page_start: int | None, title: str) -> str:
+    """Classify a TOC entry as front_matter, back_matter, or chapter."""
     if book_page_start is None or book_page_start < 1:
         return "front_matter"
     lower_title = title.lower()
@@ -103,7 +128,7 @@ def generate_toc_from_anchors(
         else:
             pdf_page_end = effective_end
         book_page_end = pdf_page_end - page_offset
-        chapter_num = i + 1
+        chapter_num = parse_chapter_num(title) or (i + 1)
         enriched.append(
             {
                 "level": 1,
@@ -128,6 +153,11 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     book_name = pdf_path.stem.lower()
     page_offset = 17 if book_name == "bates" else 0
 
+    # Ensure TOC entries are sorted by pdf_page (PyMuPDF normally returns
+    # document order, but malformed PDFs can produce unsorted entries).
+    if raw_toc:
+        raw_toc = sorted(raw_toc, key=lambda e: e[2])
+
     if raw_toc:
         detected_offset = detect_page_offset(raw_toc, BATES_CHAPTER_ANCHORS)
         if detected_offset > 0:
@@ -148,6 +178,10 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 content_end_pdf=BATES_CONTENT_END_PDF,
             )
         else:
+            print(
+                f"[error] No embedded TOC and no hardcoded anchors for '{book_name}'. "
+                f"Add chapter anchors to the script or use a PDF with an embedded TOC."
+            )
             return [], {}
 
         meta = {
@@ -200,8 +234,6 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             if content_pdf_page_start is None:
                 content_pdf_page_start = entry["pdf_page_start"]
             content_pdf_page_end = entry["pdf_page_end"]
-
-    book_name = pdf_path.stem.lower()
 
     meta = {
         "book": book_name,

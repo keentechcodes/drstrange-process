@@ -15,9 +15,11 @@ Usage:
 
 Options:
     --format=markdown|json|html   Output format (default: markdown)
-    --dpi=200|300                 PDF rasterization DPI (default: 200)
-    --chunk-pages=N               Split output every N pages (default: 50)
-    --preserve-hierarchy          Normalize heading levels across document
+    --dpi=150|200|300             PDF rasterization DPI (default: 300)
+    --tokens=N                    Max output tokens per page (default: 15000)
+    --no-hierarchy                Disable heading normalization
+    --safe                        Use anti-hallucination prompt (recommended for tables)
+    --meta-file=PATH              Path to meta.json; filters output to content pages only
 """
 
 import sys
@@ -26,7 +28,7 @@ import json
 import re
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any
 
 
 class TextbookProcessor:
@@ -57,15 +59,25 @@ Guidelines:
 - PAGE NUMBERS: Wrap in <page_number>N</page_number>
 - Only output text that is actually visible and readable in the document."""
 
+    # The monkey-patches in _apply_optimizations target docstrange internals.
+    # If docstrange is updated, these patches may silently break.  Pin the
+    # version or bump this constant and re-verify after any docstrange upgrade.
+    _DOCSTRANGE_TESTED_VERSION = "1.1.x"  # last verified compatible version
+
+    # Model to use for local GPU inference.  The model downloader in docstrange
+    # caches this under ~/.cache/docstrange/models/nanonets-ocr/.  If upgrading,
+    # clear the cache and let docstrange re-download.
+    _OCR_MODEL_ID = "nanonets/Nanonets-OCR2-3B"
+
     def __init__(
         self,
-        dpi: int = 200,
-        max_tokens: int = 8192,
+        dpi: int = 300,
+        max_tokens: int = 15000,
         use_textbook_prompt: bool = True,
         use_safe_prompt: bool = False,
         preserve_hierarchy: bool = True,
         output_format: str = "markdown",
-        chunk_pages: int = 50,
+        meta_file: str | Path | None = None,
     ):
         self.dpi = dpi
         self.max_tokens = max_tokens
@@ -73,30 +85,80 @@ Guidelines:
         self.use_safe_prompt = use_safe_prompt
         self.preserve_hierarchy = preserve_hierarchy
         self.output_format = output_format
-        self.chunk_pages = chunk_pages
         self.extractor = None
         self._page_counter = {"current": 0, "total": 0}
+        self._optimizations_applied = False
 
-    def _apply_optimizations(self) -> List[str]:
-        """Apply textbook-specific optimizations to docstrange."""
+        # Load content page range from meta.json if provided.
+        # Used to strip front/back matter from DocStrange output.
+        self._content_page_start: int | None = None
+        self._content_page_end: int | None = None
+        if meta_file is not None:
+            meta_path = Path(meta_file)
+            if not meta_path.exists():
+                print(f"[textbook] WARNING: --meta-file not found: {meta_path}")
+            else:
+                try:
+                    meta_data = json.loads(meta_path.read_text())
+                    self._content_page_start = meta_data.get("content_pdf_page_start")
+                    self._content_page_end = meta_data.get("content_pdf_page_end")
+                    print(
+                        f"[textbook] Meta loaded: content pages "
+                        f"{self._content_page_start}-{self._content_page_end}"
+                    )
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"[textbook] WARNING: Failed to parse meta file: {e}")
+
+    def _apply_optimizations(self) -> list[str]:
+        """Apply textbook-specific optimizations to docstrange.
+
+        WARNING: These patches replace internal docstrange methods via
+        monkey-patching.  They were tested against docstrange ~1.1.x.
+        If you upgrade docstrange, verify each patch still targets the
+        correct method signatures.
+        """
+        if self._optimizations_applied:
+            print("[textbook] Optimizations already applied, skipping")
+            return []
+
         optimizations = []
 
-        # Optimization 1: Higher DPI for textbook quality
+        # Version guard: warn if docstrange version is unexpected
+        try:
+            import docstrange
+
+            ds_version = getattr(docstrange, "__version__", "unknown")
+            if ds_version != "unknown" and not ds_version.startswith("1.1"):
+                print(
+                    f"[textbook] WARNING: docstrange version {ds_version} detected. "
+                    f"Monkey-patches were tested against ~1.1.x — verify compatibility."
+                )
+        except ImportError:
+            pass
+
+        # Optimization 1: Set DPI via InternalConfig (no monkey-patch needed)
+        # Upstream default is 300; we respect --dpi CLI arg.
+        # We do NOT override pdf_image_scale (upstream default 2.0 is correct).
         try:
             from docstrange.config import InternalConfig
 
             InternalConfig.pdf_image_dpi = self.dpi
-            InternalConfig.pdf_image_scale = 2.5
             optimizations.append(f"DPI={self.dpi}")
         except (ImportError, AttributeError):
             pass
 
-        # Optimization 2: SDPA attention + custom prompt + higher token limit
+        # Optimization 2: Load model with flash_attention_2 (faster than SDPA)
+        # and use Nanonets-OCR2-3B instead of the older Nanonets-OCR-s.
+        # Falls back to SDPA if flash-attn package is not installed.
+        #
+        # Uses local_files_only=True to avoid surprise multi-GB downloads at
+        # runtime.  Pre-cache the model via setup_runpod.sh or:
+        #   python -c "from huggingface_hub import snapshot_download; snapshot_download('nanonets/Nanonets-OCR2-3B')"
+        ocr_model_id = self._OCR_MODEL_ID
         try:
             import docstrange.pipeline.nanonets_processor as np_module
 
             _original_init = np_module.NanonetsDocumentProcessor._initialize_models
-            processor_self = self
 
             def _patched_init(self, cache_dir=None):
                 from transformers import (
@@ -104,34 +166,50 @@ Guidelines:
                     AutoProcessor,
                     AutoModelForImageTextToText,
                 )
-                from docstrange.pipeline.model_downloader import ModelDownloader
 
-                model_downloader = ModelDownloader(cache_dir)
-                model_path = model_downloader.get_model_path("nanonets-ocr")
-                actual_model_path = model_path / "Nanonets-OCR-ss"
-                if not actual_model_path.exists():
-                    actual_model_path = model_path
-
-                self.model = AutoModelForImageTextToText.from_pretrained(
-                    str(actual_model_path),
-                    torch_dtype="auto",
-                    device_map="auto",
-                    local_files_only=True,
-                    attn_implementation="sdpa",
-                )
+                # Try flash_attention_2 first (recommended by Nanonets for OCR2),
+                # fall back to sdpa if the flash-attn package isn't installed
+                # or if the model isn't cached locally (OSError).
+                attn_impl = "flash_attention_2"
+                try:
+                    self.model = AutoModelForImageTextToText.from_pretrained(
+                        ocr_model_id,
+                        torch_dtype="auto",
+                        device_map="auto",
+                        local_files_only=True,
+                        attn_implementation=attn_impl,
+                    )
+                except (ImportError, ValueError, OSError):
+                    attn_impl = "sdpa"
+                    try:
+                        self.model = AutoModelForImageTextToText.from_pretrained(
+                            ocr_model_id,
+                            torch_dtype="auto",
+                            device_map="auto",
+                            local_files_only=True,
+                            attn_implementation=attn_impl,
+                        )
+                    except OSError:
+                        raise RuntimeError(
+                            f"Model '{ocr_model_id}' not found in local cache. "
+                            f"Run setup_runpod.sh or manually download with:\n"
+                            f'  python -c "from huggingface_hub import snapshot_download; '
+                            f"snapshot_download('{ocr_model_id}')\""
+                        )
                 self.model.eval()
 
                 self.tokenizer = AutoTokenizer.from_pretrained(
-                    str(actual_model_path), local_files_only=True
+                    ocr_model_id, local_files_only=True
                 )
                 self.processor = AutoProcessor.from_pretrained(
-                    str(actual_model_path), local_files_only=True
+                    ocr_model_id, local_files_only=True
                 )
+                print(f"[textbook] Model: {ocr_model_id} (attn={attn_impl})")
 
             np_module.NanonetsDocumentProcessor._initialize_models = _patched_init
-            optimizations.append("SDPA attention")
+            optimizations.append(f"model={ocr_model_id}")
         except (ImportError, AttributeError) as e:
-            print(f"[textbook] SDPA patch failed: {e}")
+            print(f"[textbook] Model init patch failed: {e}")
 
         # Optimization 3: Custom textbook prompt + verbose logging
         try:
@@ -149,10 +227,10 @@ Guidelines:
                 prompt_to_use = self.DEFAULT_PROMPT
             max_tokens = self.max_tokens
 
+            _fallback_tokens = 4096
+
             def _enhanced_extract(self, image_path, max_new_tokens=None):
                 import time as _time
-
-                max_new_tokens = max_tokens
 
                 processor_self._page_counter["current"] += 1
                 n = processor_self._page_counter["current"]
@@ -165,10 +243,12 @@ Guidelines:
                     from PIL import Image
 
                     image = Image.open(image_path)
+                    # Use the default system prompt that the model was fine-tuned with.
+                    # Custom instructions belong in the user prompt, not system.
                     messages = [
                         {
                             "role": "system",
-                            "content": "You are a helpful assistant specialized in extracting educational content from textbooks.",
+                            "content": "You are a helpful assistant.",
                         },
                         {
                             "role": "user",
@@ -188,7 +268,7 @@ Guidelines:
                     inputs = inputs.to(self.model.device)
 
                     output_ids = self.model.generate(
-                        **inputs, max_new_tokens=max_new_tokens, do_sample=False
+                        **inputs, max_new_tokens=max_tokens, do_sample=False
                     )
                     generated_ids = [
                         output_ids[len(input_ids) :]
@@ -203,7 +283,7 @@ Guidelines:
                     result = output_text[0]
                 except Exception as e:
                     print(f" ERROR: {e}")
-                    return _original_extract(self, image_path, max_new_tokens or 4096)
+                    return _original_extract(self, image_path, _fallback_tokens)
 
                 elapsed = _time.time() - t
                 chars = len(result) if result else 0
@@ -224,11 +304,15 @@ Guidelines:
             print(f"[textbook] Enhanced extract patch failed: {e}")
 
         # Optimization 4: Page counter setup
+        # GPUProcessor lives at docstrange.processors.gpu_processor (confirmed
+        # from upstream source: docstrange/processors/gpu_processor.py).
+        processor_self = self
         try:
-            import docstrange.gpu_processor as gpu_mod
+            from docstrange.processors.gpu_processor import (
+                GPUProcessor as _GPUProcessor,
+            )
 
-            _original_convert = gpu_mod.GPUProcessor._convert_pdf_to_images
-            processor_self = self
+            _original_convert = _GPUProcessor._convert_pdf_to_images
 
             def _counting_convert(self, pdf_path):
                 result = _original_convert(self, pdf_path)
@@ -238,15 +322,16 @@ Guidelines:
                 print(f"[textbook] Rasterized {total} pages (DPI={processor_self.dpi})")
                 return result
 
-            gpu_mod.GPUProcessor._convert_pdf_to_images = _counting_convert
+            _GPUProcessor._convert_pdf_to_images = _counting_convert
         except (ImportError, AttributeError):
             pass
 
+        self._optimizations_applied = True
         return optimizations
 
     def _extract_images_from_pdf(
-        self, pdf_path: str, images_dir: str, min_size: int = 100
-    ) -> Dict[int, List[Dict]]:
+        self, pdf_path: str | Path, images_dir: str | Path, min_size: int = 100
+    ) -> dict[int, list[dict]]:
         """Extract embedded images from PDF for vector DB multimodal support."""
         import fitz
 
@@ -299,8 +384,8 @@ Guidelines:
         return page_images
 
     def _replace_img_tags(
-        self, markdown: str, page_images: Dict[int, List[Dict]]
-    ) -> Tuple[str, int]:
+        self, markdown: str, page_images: dict[int, list[dict]]
+    ) -> tuple[str, int]:
         """Replace <img> tags with markdown image refs."""
         img_tag_pattern = re.compile(r"<img>(.*?)</img>", re.DOTALL)
         page_header_pattern = re.compile(r"^## Page (\d+)", re.MULTILINE)
@@ -348,46 +433,99 @@ Guidelines:
         return result, matched
 
     def _normalize_headings(self, text: str) -> str:
-        """Normalize heading hierarchy across the document."""
+        """Normalize heading hierarchy so there are no level jumps > 1.
+
+        For example, if the document goes # -> ### (skipping ##), this
+        remaps the ### to ##.  Tracks a stack of "expected" levels and
+        compresses gaps so downstream parsers see a clean hierarchy.
+        """
         if not self.preserve_hierarchy:
             return text
 
         heading_pattern = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
         lines = text.split("\n")
-        result = []
+        result: list[str] = []
+        # Stack tracks the raw heading levels we've seen; the normalized
+        # level for a heading is its 1-based position in this stack.
+        level_stack: list[int] = []
 
         for line in lines:
             match = heading_pattern.match(line)
             if match:
-                level = len(match.group(1))
+                raw_level = len(match.group(1))
                 content = match.group(2)
 
-                # Normalize: ensure no level jumps > 2 (e.g., # -> ### is okay, # -> #### isn't)
-                result.append(f"{'#' * level} {content}")
+                # Pop stack back to where the current level fits
+                while level_stack and level_stack[-1] >= raw_level:
+                    level_stack.pop()
+
+                level_stack.append(raw_level)
+                normalized_level = len(level_stack)
+
+                result.append(f"{'#' * normalized_level} {content}")
             else:
                 result.append(line)
 
         return "\n".join(result)
 
+    def _filter_content_pages(self, text: str) -> str:
+        """Strip `## Page N` blocks outside the content page range.
+
+        If --meta-file was provided and contains content_pdf_page_start /
+        content_pdf_page_end, removes front matter and back matter pages
+        from the DocStrange output.  This avoids processing ~37 pages of
+        cover, preface, TOC, and index content that has no retrieval value.
+        """
+        if self._content_page_start is None or self._content_page_end is None:
+            return text
+
+        page_header_pattern = re.compile(r"^## Page (\d+)", re.MULTILINE)
+        splits = list(page_header_pattern.finditer(text))
+
+        if not splits:
+            return text
+
+        # Build list of (page_num, start, end) ranges
+        ranges = []
+        for i, m in enumerate(splits):
+            page_num = int(m.group(1))
+            start = m.start()
+            end = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+            ranges.append((page_num, start, end))
+
+        # Keep only pages within content range
+        kept_parts = []
+        removed = 0
+        for page_num, start, end in ranges:
+            if self._content_page_start <= page_num <= self._content_page_end:
+                kept_parts.append(text[start:end])
+            else:
+                removed += 1
+
+        if removed > 0:
+            print(f"[textbook] Filtered {removed} non-content pages via meta-file")
+
+        return "".join(kept_parts) if kept_parts else text
+
     def _clean_output(self, text: str) -> str:
-        """Clean and normalize output for vector DB ingestion."""
+        """Clean and normalize output for vector DB ingestion.
+
+        NOTE: <page_number> tags are intentionally preserved — the downstream
+        post-processor (postprocess_docstrange.py) relies on them to extract
+        book page numbers during Pass 1.  Do NOT convert or strip them here.
+        """
         # Remove excessive blank lines
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        # Clean up page number tags
-        text = re.sub(
-            r"<page_number>(\d+)</page_number>", r"\n<!-- Page \1 -->\n", text
-        )
-
-        # Clean watermark tags
-        text = re.sub(r"<watermark>([^<]+)</watermark>", r"", text)
+        # Strip watermark tags (no retrieval value)
+        text = re.sub(r"<watermark>[^<]*</watermark>", "", text)
 
         return text.strip()
 
     def convert(
-        self, pdf_path: str, output_dir: str
-    ) -> Tuple[Optional[Path], Dict[str, Any]]:
+        self, pdf_path: str | Path, output_dir: str | Path
+    ) -> tuple[Path | None, dict[str, Any]]:
         """Convert textbook PDF to optimized format for vector DB."""
         pdf_path = Path(pdf_path)
         output_dir = Path(output_dir)
@@ -399,12 +537,14 @@ Guidelines:
 
         t0 = time.time()
 
+        use_gpu = False
         try:
             import torch
 
-            print(f"[textbook] CUDA available: {torch.cuda.is_available()}")
+            use_gpu = torch.cuda.is_available()
+            print(f"[textbook] CUDA available: {use_gpu}")
         except ImportError:
-            pass
+            print("[textbook] torch not available, using cloud API mode")
 
         try:
             from docstrange import DocumentExtractor
@@ -415,14 +555,6 @@ Guidelines:
         opts = self._apply_optimizations()
         if opts:
             print(f"[textbook] Optimizations: {', '.join(opts)}")
-
-        use_gpu = False
-        try:
-            import torch
-
-            use_gpu = torch.cuda.is_available()
-        except ImportError:
-            pass
 
         mode = "GPU local" if use_gpu else "cloud API"
         print(f"[textbook] Mode: {mode}")
@@ -465,7 +597,10 @@ Guidelines:
             print("[textbook] WARNING: No text extracted")
             return None, {"error": "No text extracted"}
 
-        # Post-processing
+        # Post-processing: filter non-content pages first (if meta-file provided)
+        if self.output_format == "markdown":
+            text = self._filter_content_pages(text)
+
         if self.preserve_hierarchy and self.output_format == "markdown":
             text = self._normalize_headings(text)
 
@@ -495,7 +630,7 @@ Guidelines:
         # Metadata
         meta = {
             "tool": "docstrange-textbook",
-            "model": "nanonets/Nanonets-OCR-s (~4B VLM)",
+            "model": "nanonets/Nanonets-OCR2-3B (Qwen2.5-VL-3B fine-tune)",
             "mode": mode,
             "output_format": self.output_format,
             "dpi": self.dpi,
@@ -540,14 +675,14 @@ def main():
         "--dpi",
         type=int,
         choices=[150, 200, 300],
-        default=200,
-        help="PDF rasterization DPI (default: 200)",
+        default=300,
+        help="PDF rasterization DPI (default: 300)",
     )
     parser.add_argument(
         "--tokens",
         type=int,
-        default=8192,
-        help="Max output tokens per page (default: 8192)",
+        default=15000,
+        help="Max output tokens per page (default: 15000)",
     )
     parser.add_argument(
         "--no-hierarchy", action="store_true", help="Disable heading normalization"
@@ -558,10 +693,9 @@ def main():
         help="Use safe prompt with anti-hallucination guardrails (recommended for tables)",
     )
     parser.add_argument(
-        "--chunk-pages",
-        type=int,
-        default=50,
-        help="Split output every N pages (future feature)",
+        "--meta-file",
+        default=None,
+        help="Path to meta.json (from extract_toc.py); filters output to content pages only",
     )
 
     args = parser.parse_args()
@@ -573,7 +707,7 @@ def main():
         use_safe_prompt=args.safe,
         preserve_hierarchy=not args.no_hierarchy,
         output_format=args.format,
-        chunk_pages=args.chunk_pages,
+        meta_file=args.meta_file,
     )
 
     output_path, meta = processor.convert(args.pdf, args.output_dir)
