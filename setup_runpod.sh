@@ -97,7 +97,7 @@ else
     # Requires torch to be installed first; needs --no-build-isolation
     if command -v nvidia-smi &> /dev/null; then
         echo "[venv] Building flash-attn (this takes 5-15 minutes)..."
-        uv pip install --python "$VENV_DIR/bin/python" setuptools wheel
+        uv pip install --python "$VENV_DIR/bin/python" setuptools wheel psutil
         if uv pip install --python "$VENV_DIR/bin/python" \
             "flash-attn>=2.7.3" --no-build-isolation 2>&1 | tail -10; then
             echo "[venv] flash-attn installed!"
