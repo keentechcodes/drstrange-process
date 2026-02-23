@@ -187,30 +187,36 @@ STRICT RULES:
             _original_init = np_module.NanonetsDocumentProcessor._initialize_models
 
             def _patched_init(self, cache_dir=None):
+                import torch as _torch
                 from transformers import (
                     AutoTokenizer,
                     AutoProcessor,
                     AutoModelForImageTextToText,
                 )
 
-                # Try flash_attention_2 first (recommended by Nanonets for OCR2),
+                # Try flash_attention_2 first (recommended by Nanonets/Qwen docs),
                 # fall back to sdpa if the flash-attn package isn't installed
                 # or if the model isn't cached locally (OSError).
+                # Use bfloat16 explicitly per Qwen2.5-VL docs (torch_dtype="auto"
+                # can resolve to a type flash-attn doesn't support).
                 attn_impl = "flash_attention_2"
                 try:
                     self.model = AutoModelForImageTextToText.from_pretrained(
                         ocr_model_id,
-                        torch_dtype="auto",
+                        torch_dtype=_torch.bfloat16,
                         device_map="auto",
                         local_files_only=True,
                         attn_implementation=attn_impl,
                     )
-                except (ImportError, ValueError, OSError):
+                except (ImportError, ValueError, OSError) as fa_err:
+                    print(
+                        f"[textbook] flash_attention_2 failed: {type(fa_err).__name__}: {fa_err}"
+                    )
                     attn_impl = "sdpa"
                     try:
                         self.model = AutoModelForImageTextToText.from_pretrained(
                             ocr_model_id,
-                            torch_dtype="auto",
+                            torch_dtype=_torch.bfloat16,
                             device_map="auto",
                             local_files_only=True,
                             attn_implementation=attn_impl,
