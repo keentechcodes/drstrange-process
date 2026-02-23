@@ -79,6 +79,88 @@ RE_HEADER_TAG = re.compile(r"<header>.*?</header>", re.DOTALL)
 RE_PAGE_SEPARATOR = re.compile(r"^---\s*$", re.MULTILINE)
 
 
+def _pass0_pre_clean(markdown: str, meta: dict[str, Any] | None = None) -> str:
+    """Pre-clean markdown before page splitting.
+
+    Fixes converter artefacts that would break page splitting:
+    1. Malformed page headers: '</table>## Page N' on same line
+       → inserts newline so the regex ^## Page can match.
+    2. Prompt leak: the model sometimes echoes the STRICT RULES block
+       from the OCR prompt instead of extracting page content.
+       Detected on 9 chapter-opener pages in run 2. Strip entirely.
+    3. H1 page header: '# Page 1' (heading normalization changed the
+       level) → normalize to '## Page 1'.
+    4. Un-renumbered pages: chapter opener pages that were stuck in
+       '</table>## Page N' format weren't renumbered by the converter.
+       They keep PDF page numbers while all other pages have book page
+       numbers.  Detect by non-monotonic sequence and renumber.
+    """
+    fixes = 0
+
+    # Fix 1: malformed page headers — ensure ## Page N starts on its own line.
+    # Handles '</table>## Page N' and any other prefix stuck to the header.
+    fixed, count = re.subn(r"([^\n])(#{1,2}\s+Page\s+\d+)", r"\1\n\2", markdown)
+    if count:
+        markdown = fixed
+        fixes += count
+
+    # Fix 2: strip STRICT RULES prompt leak blocks.
+    # Pattern: starts with "STRICT RULES:" and runs through the numbered rules.
+    # May end with "---" separator or run to end of page.
+    markdown, count = re.subn(
+        r"STRICT RULES:\n(?:.*\n)*?(?:---\s*\n|(?=\n## Page )|\Z)",
+        "",
+        markdown,
+    )
+    if count:
+        fixes += count
+
+    # Fix 3: normalize '# Page N' (H1) to '## Page N' (H2)
+    markdown, count = re.subn(
+        r"^# (Page\s+\d+)\s*$", r"## \1", markdown, flags=re.MULTILINE
+    )
+    if count:
+        fixes += count
+
+    # Fix 4: renumber un-renumbered pages.
+    # After fixes 1-3, pages should be mostly monotonic (book page numbers).
+    # Pages that the converter failed to renumber still have PDF page numbers.
+    # Detect: a page N where N > prev+5 AND N-offset would restore order.
+    page_offset = (meta or {}).get("page_offset", 0)
+    if page_offset > 0:
+        page_header_re = re.compile(r"^(#{1,2}\s+Page\s+)(\d+)(\s*)$", re.MULTILINE)
+        matches = list(page_header_re.finditer(markdown))
+        page_nums = [int(m.group(2)) for m in matches]
+
+        # Find non-monotonic pages that are exactly offset too high
+        to_fix: dict[int, int] = {}  # match_index -> corrected_page_num
+        for idx in range(1, len(page_nums)):
+            prev = page_nums[idx - 1]
+            curr = page_nums[idx]
+            corrected = curr - page_offset
+            # Page is out of order AND subtracting offset restores it
+            if curr > prev + 5 and corrected == prev + 1:
+                to_fix[idx] = corrected
+
+        if to_fix:
+            # Apply replacements in reverse order to preserve positions
+            for idx in sorted(to_fix.keys(), reverse=True):
+                m = matches[idx]
+                new_num = to_fix[idx]
+                replacement = f"{m.group(1)}{new_num}{m.group(3)}"
+                markdown = markdown[: m.start()] + replacement + markdown[m.end() :]
+            fixes += len(to_fix)
+            print(
+                f"[pass0] Renumbered {len(to_fix)} un-renumbered page(s) "
+                f"(offset={page_offset})"
+            )
+
+    if fixes:
+        print(f"[pass0] Pre-cleaned {fixes} total artefact(s)")
+
+    return markdown
+
+
 def pass1_split_pages(
     markdown: str,
     meta: dict[str, Any],
@@ -173,6 +255,9 @@ def pass1_split_pages(
         # Strip boilerplate
         cleaned = raw
 
+        # Strip stray </table> at start of page (from converter force-close)
+        cleaned = re.sub(r"^\s*</table>\s*", "", cleaned)
+
         # Strip <page_number> tags (we already extracted the values)
         cleaned = RE_PAGE_NUMBER_TAG.sub("", cleaned)
 
@@ -189,6 +274,9 @@ def pass1_split_pages(
 
         # Strip <header>C H A P T E R N</header> lines
         cleaned = RE_SPACED_CHAPTER.sub("", cleaned)
+
+        # Strip standalone "CHAPTER" lines (artefact from chapter opener pages)
+        cleaned = re.sub(r"^\s*CHAPTER\s*$", "", cleaned, flags=re.MULTILINE)
 
         # Strip remaining <header>...</header> tags (running headers wrapped in header tags)
         cleaned = RE_HEADER_TAG.sub("", cleaned)
@@ -820,7 +908,8 @@ def postprocess(
     toc: list[dict[str, Any]],
     meta: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Run all 6 passes and return final PageBlock list."""
+    """Run Pass 0 pre-clean + 6 passes and return final PageBlock list."""
+    markdown = _pass0_pre_clean(markdown, meta)
     is_sample = _detect_is_sample(markdown, meta)
     blocks = pass1_split_pages(markdown, meta, toc_entries=toc)
     blocks = pass2_assign_chapters(blocks, toc, is_sample=is_sample)
