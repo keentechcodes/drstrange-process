@@ -5,21 +5,23 @@ https://github.com/NanoNets/docstrange
 
 Enhanced version for multimodal textbook processing with:
 - Higher DPI for diagram/chart clarity
-- Increased token limits for dense pages
+- Anti-hallucination prompts and per-page validation
 - Custom OCR prompt for better hierarchy preservation
-- Post-processing for vector DB optimization
+- Post-processing: page filtering, hallucination detection, page renumbering
 - Multiple output formats (markdown, JSON, HTML)
 
 Usage:
     .venvs/docstrange/bin/python run_docstrange_textbook.py <pdf> [output_dir] [options]
 
 Options:
-    --format=markdown|json|html   Output format (default: markdown)
-    --dpi=150|200|300             PDF rasterization DPI (default: 300)
-    --tokens=N                    Max output tokens per page (default: 15000)
-    --no-hierarchy                Disable heading normalization
-    --safe                        Use anti-hallucination prompt (recommended for tables)
-    --meta-file=PATH              Path to meta.json; filters output to content pages only
+    --format=markdown|json|html       Output format (default: markdown)
+    --dpi=150|200|300                 PDF rasterization DPI (default: 300)
+    --tokens=N                        Max output tokens per page (default: 8000)
+    --no-hierarchy                    Disable heading normalization
+    --safe                            Use safe prompt variant (stricter guardrails)
+    --meta-file=PATH                  Path to meta.json; filters + renumbers pages
+    --max-chars-per-page=N            Per-page char limit (default: 10000)
+    --no-hallucination-detection      Disable per-page validation/cleanup
 """
 
 import sys
@@ -36,28 +38,35 @@ class TextbookProcessor:
 
     DEFAULT_PROMPT = """Extract the text from the above document as if you were reading it naturally. Return the tables in html format. Return the equations in LaTeX representation. If there is an image in the document and image caption is not present, add a small description of the image inside the <img></img> tag; otherwise, add the image caption inside <img></img>. Watermarks should be wrapped in brackets. Ex: <watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: <page_number>14</page_number> or <page_number>9/22</page_number>. Prefer using ☐ and ☑ for check boxes."""
 
-    TEXTBOOK_PROMPT = """Extract the text from this textbook page preserving the document hierarchy and structure:
+    TEXTBOOK_PROMPT = """Extract ONLY the text that is clearly visible and readable in the image.
+DO NOT generate content that is not explicitly present. DO NOT invent, assume, or hallucinate.
 
-1. HEADINGS: Use proper markdown heading levels (# for chapter titles, ## for sections, ### for subsections)
-2. TABLES: Return in HTML <table> format with proper <thead> and <tbody>
-3. EQUATIONS: Return in LaTeX format with $$ for display and $ for inline
-4. IMAGES: Describe educational images/diagrams in <img>detailed description of what the image shows, including labels, diagrams, charts, and educational content</img>
-5. FIGURES: Preserve figure captions and numbers (e.g., "Figure 15-1: Anatomy of...")
-6. LISTS: Preserve numbered and bulleted lists with proper indentation
-7. SIDEBARS/CALLOUTS: Wrap in <callout>...</callout> tags
-8. PAGE NUMBERS: Wrap in <page_number>123</page_number>
-9. VOCABULARY/DEFINITIONS: Format as **Term**: Definition
-10. MAINTAIN reading order and logical flow of educational content"""
+STRICT RULES:
+1. NO CODE BLOCKS: Do NOT use mermaid, ```, or any code block syntax. Describe flowcharts and diagrams in <img> tags instead.
+2. TABLES: Use HTML <table> ONLY if cell contents are clearly readable. NEVER create tables with empty header cells. If a table is too complex or unreadable, describe its structure in plain text.
+3. MAX OUTPUT: Aim for 2,000-8,000 characters per page. STOP if generating more than 10,000 characters.
+4. IMAGES/DIAGRAMS: Briefly describe in <img>2-3 sentence description</img>. Do NOT invent details not visible in the image.
+5. PAGE NUMBERS: Wrap in <page_number>N</page_number> ONLY if clearly visible.
+6. HEADINGS: Use markdown heading levels (# for chapter titles, ## for sections, ### for subsections) based on visual hierarchy.
+7. LISTS: Preserve numbered and bulleted lists with proper indentation.
+8. EQUATIONS: Return in LaTeX format with $$ for display and $ for inline.
+9. FIGURES: Preserve figure captions and numbers (e.g., "Figure 15-1: Anatomy of...").
+10. IF CONTENT IS UNCLEAR: Output "[Content unclear]" rather than guessing.
+
+For complex forms (MoCA, screening tools, assessments), extract only clearly readable field labels and instructions. DO NOT recreate the entire form structure with empty cells."""
 
     SAFE_TEXTBOOK_PROMPT = """Extract the text from this textbook page exactly as written. Do not hallucinate or add content that is not visible in the image.
 
-Guidelines:
-- TABLES: If you can read the table cells, output them in HTML <table> format. If cells are unreadable, use empty cells rather than guessing content.
-- HEADINGS: Use markdown heading levels (# ## ###) based on visual hierarchy
-- LISTS: Preserve bullet and numbered lists exactly as formatted
+STRICT RULES:
+- NO CODE BLOCKS: Do NOT use mermaid, ```, or any code block syntax.
+- TABLES: Use HTML <table> ONLY if cell contents are clearly readable. If cells are unreadable, describe the table structure in plain text. NEVER generate more than 20 empty table cells.
+- HEADINGS: Use markdown heading levels (# ## ###) based on visual hierarchy.
+- LISTS: Preserve bullet and numbered lists exactly as formatted.
 - IMAGES: Briefly describe what is shown in <img>brief description</img> tags. Do not invent details.
-- PAGE NUMBERS: Wrap in <page_number>N</page_number>
-- Only output text that is actually visible and readable in the document."""
+- PAGE NUMBERS: Wrap in <page_number>N</page_number> ONLY if clearly visible.
+- MAX OUTPUT: Aim for 2,000-8,000 characters per page. STOP if approaching 10,000 characters.
+- Only output text that is actually visible and readable in the document.
+- IF CONTENT IS UNCLEAR: Output "[Content unclear]" rather than guessing."""
 
     # The monkey-patches in _apply_optimizations target docstrange internals.
     # If docstrange is updated, these patches may silently break.  Pin the
@@ -69,15 +78,29 @@ Guidelines:
     # clear the cache and let docstrange re-download.
     _OCR_MODEL_ID = "nanonets/Nanonets-OCR2-3B"
 
+    # Known hallucination signatures to detect and remove.
+    _CV_HALLUCINATION_MARKER = "Chapter 15: Advanced Topics in Computer Vision"
+    _CV_HALLUCINATION_PHRASES = [
+        "Object detection",
+        "convolutional neural network",
+        "image classification",
+        "deep learning",
+        "neural network architecture",
+    ]
+    _MAX_EMPTY_TH_CELLS = 20  # Flag tables with more empty <th> than this
+    _MAX_CHARS_PER_PAGE = 10000  # Pages above this are likely hallucinated
+
     def __init__(
         self,
         dpi: int = 300,
-        max_tokens: int = 15000,
+        max_tokens: int = 8000,
         use_textbook_prompt: bool = True,
         use_safe_prompt: bool = False,
         preserve_hierarchy: bool = True,
         output_format: str = "markdown",
         meta_file: str | Path | None = None,
+        max_chars_per_page: int = 10000,
+        enable_hallucination_detection: bool = True,
     ):
         self.dpi = dpi
         self.max_tokens = max_tokens
@@ -85,8 +108,11 @@ Guidelines:
         self.use_safe_prompt = use_safe_prompt
         self.preserve_hierarchy = preserve_hierarchy
         self.output_format = output_format
+        self.max_chars_per_page = max_chars_per_page
+        self.enable_hallucination_detection = enable_hallucination_detection
         self.extractor = None
         self._page_counter = {"current": 0, "total": 0}
+        self._page_issues: list[str] = []  # Collects per-page validation warnings
         self._optimizations_applied = False
 
         # Load content page range from meta.json if provided.
@@ -508,6 +534,208 @@ Guidelines:
 
         return "".join(kept_parts) if kept_parts else text
 
+    def _validate_page_content(self, page_content: str, page_num: int) -> str:
+        """Validate and clean a single page's content post-generation.
+
+        Detects hallucination patterns and applies safety limits:
+        - CV/deep-learning hallucination blocks (known model failure mode)
+        - Excessive empty table headers (MoCA-style structural hallucination)
+        - Unclosed or excessive mermaid blocks
+        - Pages exceeding max character limit
+
+        Returns cleaned content.  Issues are logged to self._page_issues.
+        """
+        if not self.enable_hallucination_detection:
+            return page_content
+
+        original_length = len(page_content)
+
+        # Check 1: CV hallucination — identical 6K-char blocks about CNNs
+        if self._CV_HALLUCINATION_MARKER in page_content:
+            self._page_issues.append(
+                f"Page {page_num}: CV hallucination detected — replaced with marker"
+            )
+            page_content = (
+                f"[HALLUCINATED CONTENT REMOVED — page {page_num} contained "
+                f"fabricated computer vision content not present in source]\n"
+            )
+            return page_content
+
+        # Check 1b: CV hallucination without exact marker — score by phrase count
+        cv_score = sum(
+            1
+            for phrase in self._CV_HALLUCINATION_PHRASES
+            if phrase.lower() in page_content.lower()
+        )
+        if cv_score >= 3:
+            self._page_issues.append(
+                f"Page {page_num}: Probable CV hallucination "
+                f"({cv_score}/{len(self._CV_HALLUCINATION_PHRASES)} phrases) — replaced"
+            )
+            page_content = (
+                f"[HALLUCINATED CONTENT REMOVED — page {page_num} contained "
+                f"probable fabricated content ({cv_score} CV phrases detected)]\n"
+            )
+            return page_content
+
+        # Check 2: Mermaid blocks — strip entirely, replace with description tag
+        if "<mermaid>" in page_content or "```mermaid" in page_content:
+            # Handle <mermaid>...</mermaid> (closed)
+            mermaid_count = page_content.count("<mermaid>")
+            page_content = re.sub(
+                r"<mermaid>.*?</mermaid>",
+                "<img>Diagram or flowchart present in original document</img>",
+                page_content,
+                flags=re.DOTALL,
+            )
+            # Handle unclosed <mermaid> (runs to end of page content)
+            if "<mermaid>" in page_content:
+                page_content = re.sub(
+                    r"<mermaid>.*",
+                    "<img>Diagram or flowchart present in original document</img>",
+                    page_content,
+                    flags=re.DOTALL,
+                )
+            # Handle ```mermaid ... ``` code blocks
+            page_content = re.sub(
+                r"```mermaid.*?```",
+                "<img>Diagram or flowchart present in original document</img>",
+                page_content,
+                flags=re.DOTALL,
+            )
+            # Handle unclosed ```mermaid
+            if "```mermaid" in page_content:
+                page_content = re.sub(
+                    r"```mermaid.*",
+                    "<img>Diagram or flowchart present in original document</img>",
+                    page_content,
+                    flags=re.DOTALL,
+                )
+            if mermaid_count > 0:
+                self._page_issues.append(
+                    f"Page {page_num}: {mermaid_count} mermaid block(s) replaced"
+                )
+
+        # Check 3: Excessive empty table headers (MoCA / form hallucination)
+        empty_th_count = len(re.findall(r"<th>\s*</th>", page_content))
+        if empty_th_count > self._MAX_EMPTY_TH_CELLS:
+            self._page_issues.append(
+                f"Page {page_num}: {empty_th_count} empty <th> cells — "
+                f"table structure likely hallucinated, removing tables"
+            )
+            # Remove all tables on this page — they're unreliable
+            page_content = re.sub(
+                r"<table>.*?</table>",
+                "<img>Table or form present in original document</img>",
+                page_content,
+                flags=re.DOTALL,
+            )
+            # Also handle unclosed tables
+            if "<table>" in page_content:
+                page_content = re.sub(
+                    r"<table>.*",
+                    "<img>Table or form present in original document</img>",
+                    page_content,
+                    flags=re.DOTALL,
+                )
+
+        # Check 4: Force-close any unclosed tables (even if not excessive)
+        open_tables = page_content.count("<table>")
+        close_tables = page_content.count("</table>")
+        if open_tables > close_tables:
+            self._page_issues.append(
+                f"Page {page_num}: {open_tables - close_tables} unclosed table(s) — "
+                f"force-closing"
+            )
+            # Add missing closing tags at end
+            page_content += "\n</table>" * (open_tables - close_tables)
+
+        # Check 5: Excessive length — likely hallucinated repetition
+        if len(page_content) > self.max_chars_per_page:
+            self._page_issues.append(
+                f"Page {page_num}: Excessive length ({original_length:,} chars, "
+                f"limit {self.max_chars_per_page:,}) — truncated"
+            )
+            # Truncate but try to break at a newline
+            truncated = page_content[: self.max_chars_per_page]
+            last_newline = truncated.rfind("\n")
+            if last_newline > self.max_chars_per_page * 0.8:
+                truncated = truncated[:last_newline]
+            page_content = truncated + "\n\n[Content truncated — exceeded page limit]\n"
+
+        return page_content
+
+    def _validate_all_pages(self, text: str) -> str:
+        """Run per-page validation on the full markdown output.
+
+        Splits by `## Page N` headers, validates each page, and reassembles.
+        """
+        if not self.enable_hallucination_detection:
+            return text
+
+        page_header_pattern = re.compile(r"^(## Page \d+)", re.MULTILINE)
+        splits = list(page_header_pattern.finditer(text))
+
+        if not splits:
+            return text
+
+        # Build (header, page_num, content) tuples
+        pages: list[tuple[str, int, str]] = []
+        for i, m in enumerate(splits):
+            header = m.group(1)
+            page_num = int(header.split()[-1])
+            start = m.end()
+            end = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+            content = text[start:end]
+            pages.append((header, page_num, content))
+
+        # Validate each page
+        validated_parts = []
+        for header, page_num, content in pages:
+            cleaned = self._validate_page_content(content, page_num)
+            validated_parts.append(f"{header}{cleaned}")
+
+        # Prepend any content before the first ## Page header
+        prefix = text[: splits[0].start()] if splits[0].start() > 0 else ""
+
+        result = prefix + "".join(validated_parts)
+
+        if self._page_issues:
+            print(
+                f"[textbook] Page validation found {len(self._page_issues)} issue(s):"
+            )
+            for issue in self._page_issues:
+                print(f"  - {issue}")
+
+        return result
+
+    def _renumber_pages(self, text: str) -> str:
+        """Renumber `## Page N` headers so Page 1 = first content page.
+
+        DocStrange numbers pages sequentially starting from PDF page 1.
+        When --meta-file is used, front matter is stripped but page numbers
+        still reflect PDF numbering (e.g., ## Page 18 for the first content
+        page).  This method renumbers so the first content page becomes
+        ## Page 1, matching the book's own pagination.
+
+        The renumbering uses page_offset from meta.json: new_num = old_num - offset.
+        """
+        if self._content_page_start is None:
+            return text
+
+        offset = self._content_page_start - 1  # e.g., 18 - 1 = 17
+
+        def _renumber(match: re.Match) -> str:
+            old_num = int(match.group(1))
+            new_num = old_num - offset
+            return f"## Page {new_num}"
+
+        result = re.sub(r"^## Page (\d+)", _renumber, text, flags=re.MULTILINE)
+        print(
+            f"[textbook] Renumbered pages: offset={offset} (PDF page {self._content_page_start} → Page 1)"
+        )
+        return result
+
     def _clean_output(self, text: str) -> str:
         """Clean and normalize output for vector DB ingestion.
 
@@ -597,9 +825,16 @@ Guidelines:
             print("[textbook] WARNING: No text extracted")
             return None, {"error": "No text extracted"}
 
-        # Post-processing: filter non-content pages first (if meta-file provided)
+        # Post-processing pipeline (markdown only):
+        # 1. Filter non-content pages (front/back matter)
+        # 2. Validate pages (hallucination detection, mermaid/table cleanup)
+        # 3. Renumber pages (PDF page → book page)
+        # 4. Normalize heading hierarchy
+        # 5. Clean output (blank lines, watermarks)
         if self.output_format == "markdown":
             text = self._filter_content_pages(text)
+            text = self._validate_all_pages(text)
+            text = self._renumber_pages(text)
 
         if self.preserve_hierarchy and self.output_format == "markdown":
             text = self._normalize_headings(text)
@@ -635,6 +870,8 @@ Guidelines:
             "output_format": self.output_format,
             "dpi": self.dpi,
             "max_tokens": self.max_tokens,
+            "max_chars_per_page": self.max_chars_per_page,
+            "hallucination_detection": self.enable_hallucination_detection,
             "preserve_hierarchy": self.preserve_hierarchy,
             "model_load_time": round(model_time, 2),
             "conversion_time": round(convert_time, 2),
@@ -644,6 +881,8 @@ Guidelines:
             "images_extracted": images_extracted,
             "images_matched": images_matched,
             "pages_processed": self._page_counter["total"],
+            "page_issues": self._page_issues,
+            "page_issues_count": len(self._page_issues),
         }
 
         (output_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
@@ -681,8 +920,8 @@ def main():
     parser.add_argument(
         "--tokens",
         type=int,
-        default=15000,
-        help="Max output tokens per page (default: 15000)",
+        default=8000,
+        help="Max output tokens per page (default: 8000)",
     )
     parser.add_argument(
         "--no-hierarchy", action="store_true", help="Disable heading normalization"
@@ -697,6 +936,17 @@ def main():
         default=None,
         help="Path to meta.json (from extract_toc.py); filters output to content pages only",
     )
+    parser.add_argument(
+        "--max-chars-per-page",
+        type=int,
+        default=10000,
+        help="Max characters per page before truncation (default: 10000)",
+    )
+    parser.add_argument(
+        "--no-hallucination-detection",
+        action="store_true",
+        help="Disable per-page hallucination detection and cleanup",
+    )
 
     args = parser.parse_args()
 
@@ -708,6 +958,8 @@ def main():
         preserve_hierarchy=not args.no_hierarchy,
         output_format=args.format,
         meta_file=args.meta_file,
+        max_chars_per_page=args.max_chars_per_page,
+        enable_hallucination_detection=not args.no_hallucination_detection,
     )
 
     output_path, meta = processor.convert(args.pdf, args.output_dir)

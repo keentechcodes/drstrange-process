@@ -98,22 +98,32 @@ def pass1_split_pages(
         print("[pass1] WARNING: No ## Page N headers found")
         return []
 
-    # Build (pdf_page, raw_content) pairs
+    # Build (pdf_page, raw_content) pairs.
+    #
+    # Page numbering convention:
+    # - Old converter: ## Page N where N = PDF page number (e.g., 18 for first content page)
+    # - New converter (with --meta-file): ## Page N where N = book page number
+    #   (renumbered so first content page = 1).
+    #
+    # We detect which convention is in use and reconvert to PDF page numbers
+    # so the rest of the pipeline (content filtering, chapter matching) works
+    # unchanged.
     raw_pages: list[tuple[int, str]] = []
     for i, m in enumerate(splits):
-        pdf_page = int(m.group(1))
+        raw_page_num = int(m.group(1))
         start = m.end()
         end = splits[i + 1].start() if i + 1 < len(splits) else len(markdown)
         raw_content = markdown[start:end]
-        raw_pages.append((pdf_page, raw_content))
+        raw_pages.append((raw_page_num, raw_content))
 
-    # Determine if page numbers are relative (sample PDF) or absolute (full book).
-    # DocStrange always numbers pages sequentially starting from 1, regardless
-    # of the actual PDF page numbers.  For the full book, "## Page 18" is PDF
-    # page 18; for a sample, "## Page 1" is just the first page of the sample.
+    # Determine if page numbers are relative (sample PDF), book-page-numbered
+    # (new converter), or absolute PDF page numbers (old converter).
     #
-    # Heuristic: if the file has significantly fewer pages than the total in
-    # meta, it's a sample — skip content range filtering.
+    # Detection heuristic:
+    # - Sample: significantly fewer pages than total_pdf_pages
+    # - Book-page-numbered: first page number is small (< page_offset) AND
+    #   page_offset > 0 AND not a sample
+    # - Absolute PDF: first page number >= content_pdf_page_start
     all_page_nums = [p for p, _ in raw_pages]
     total_pdf_pages = meta.get("total_pdf_pages", 0)
     is_sample = (
@@ -126,9 +136,31 @@ def pass1_split_pages(
             f"{total_pdf_pages} total). Keeping all pages."
         )
 
+    # Detect book-page-numbered input from the new converter.
+    # If the first page number is 1 (or small) and page_offset > 0 and it's
+    # not a sample, the page numbers are book pages, not PDF pages.
+    # Reconvert: pdf_page = book_page + page_offset.
+    is_book_page_numbered = False
+    if (
+        not is_sample
+        and page_offset > 0
+        and all_page_nums
+        and all_page_nums[0] < page_offset
+    ):
+        is_book_page_numbered = True
+        print(
+            f"[pass1] Detected book-page-numbered input "
+            f"(first page={all_page_nums[0]}, offset={page_offset}). "
+            f"Reconverting to PDF page numbers."
+        )
+        raw_pages = [(p + page_offset, raw) for p, raw in raw_pages]
+
     blocks: list[dict[str, Any]] = []
     for pdf_page, raw in raw_pages:
-        # Filter to content pages for full book processing only
+        # Filter to content pages for full book processing only.
+        # When input is book-page-numbered, pages have already been reconverted
+        # to PDF page numbers above, and front-matter was already filtered by
+        # the converter, so this filter is a no-op safety net.
         if content_start and content_end and not is_sample:
             if not (content_start <= pdf_page <= content_end):
                 continue
