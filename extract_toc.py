@@ -63,12 +63,13 @@ def parse_chapter_num(title: str) -> int | None:
     return None
 
 
-def detect_page_offset(toc: list[tuple[int, str, int]], anchors: dict[str, int]) -> int:
-    """Detect the page offset by matching TOC entries against known anchors.
+def detect_page_offset_from_anchors(
+    toc: list[tuple[int, str, int]], anchors: dict[str, int]
+) -> int:
+    """Detect page offset by matching TOC entries against known anchor titles.
 
-    Collects offsets from all matching anchors and returns the most common
-    (mode) to guard against a single mislabeled TOC entry skewing the result.
-    Returns 0 if no anchors match.
+    Used for books like Bates where we have hardcoded chapter → book page
+    mappings.  Returns 0 if no anchors match.
     """
     from collections import Counter
 
@@ -84,12 +85,11 @@ def detect_page_offset(toc: list[tuple[int, str, int]], anchors: dict[str, int])
                 or clean_title.lower() in anchor_title.lower()
             ):
                 offsets.append(pdf_page - book_page)
-                break  # one match per TOC entry is enough
+                break
 
     if not offsets:
         return 0
 
-    # Return the most common offset (mode); if there's a tie, pick the first
     offset_counts = Counter(offsets)
     best_offset, count = offset_counts.most_common(1)[0]
     if count < len(offsets):
@@ -99,6 +99,47 @@ def detect_page_offset(toc: list[tuple[int, str, int]], anchors: dict[str, int])
             f"Using {best_offset} ({count}/{len(offsets)} matches). "
             f"Outliers: {mismatches}"
         )
+    return best_offset
+
+
+def detect_page_offset_from_toc(toc: list[tuple[int, str, int]]) -> int:
+    """Detect page offset from an embedded TOC by finding the first numbered chapter.
+
+    Looks for entries like "1 The Practice of Medicine" at a known PDF page.
+    The chapter's book page is assumed to be its number (chapter 1 → book page 1).
+    Offset = pdf_page - book_page.
+
+    Heuristic: find the first L2 (or L1) entry whose title starts with "1 "
+    or "PART 1".  For books where Part 1 / Chapter 1 starts on book page 1,
+    the offset = pdf_page_of_that_entry - 1.
+
+    Falls back to examining multiple low-numbered chapters and taking the mode.
+    """
+    from collections import Counter
+
+    offsets: list[int] = []
+    for level, title, pdf_page in toc:
+        m = re.match(r"^(\d+)\s+\S", title)
+        if m:
+            chapter_num = int(m.group(1))
+            if chapter_num > 10:
+                continue  # only use early chapters for offset detection
+            # Assumption: chapter N starts on book page N only for chapter 1.
+            # For others, we can't know the book page from the chapter number.
+            # But we CAN use the pattern: for most textbooks, the first chapter
+            # in the TOC (chapter 1 or Part 1) starts on book page 1.
+            if chapter_num == 1:
+                offsets.append(pdf_page - 1)
+
+        # Also check for "PART 1" patterns — these often start on page 1
+        if re.match(r"^PART\s+1\b", title, re.IGNORECASE) and level == 1:
+            offsets.append(pdf_page - 1)
+
+    if not offsets:
+        return 0
+
+    offset_counts = Counter(offsets)
+    best_offset, count = offset_counts.most_common(1)[0]
     return best_offset
 
 
@@ -151,6 +192,8 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     doc.close()
 
     book_name = pdf_path.stem.lower()
+    # Default offset; will be overridden by TOC detection if possible.
+    # Bates has no embedded TOC, so we keep its known offset as fallback.
     page_offset = 17 if book_name == "bates" else 0
 
     # Ensure TOC entries are sorted by pdf_page (PyMuPDF normally returns
@@ -158,13 +201,28 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if raw_toc:
         raw_toc = sorted(raw_toc, key=lambda e: e[2])
 
-    if raw_toc:
-        detected_offset = detect_page_offset(raw_toc, BATES_CHAPTER_ANCHORS)
+        # For Bates: try anchor-based detection (known chapter → book page mapping).
+        # For other books: use embedded TOC heuristic (first chapter at PDF page N → offset).
+        # Only try Bates anchors for Bates PDFs to avoid false substring matches.
+        detected_offset = 0
+        offset_source = "default"
+
+        if book_name == "bates":
+            detected_offset = detect_page_offset_from_anchors(
+                raw_toc, BATES_CHAPTER_ANCHORS
+            )
+            if detected_offset > 0:
+                offset_source = "anchor matching"
+
+        if detected_offset == 0:
+            detected_offset = detect_page_offset_from_toc(raw_toc)
+            if detected_offset > 0:
+                offset_source = "embedded TOC"
+
         if detected_offset > 0:
             page_offset = detected_offset
-        print(
-            f"[toc] Using page offset: {page_offset} (from {'PDF TOC' if detected_offset else 'default'})"
-        )
+
+        print(f"[toc] Using page offset: {page_offset} (from {offset_source})")
     else:
         print(
             f"[warn] No embedded TOC in {pdf_path.name}, generating from known chapter anchors"
@@ -207,6 +265,11 @@ def extract_toc(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             pdf_page_end = raw_toc[i + 1][2] - 1
         else:
             pdf_page_end = total_pdf_pages
+
+        # Container entries (Parts, Sections) may start on the same page as
+        # their first child, giving pdf_page_end < pdf_page_start.  Clamp.
+        if pdf_page_end < pdf_page_start:
+            pdf_page_end = pdf_page_start
 
         book_page_start = pdf_page_start - page_offset
         book_page_end = pdf_page_end - page_offset
