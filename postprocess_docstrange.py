@@ -264,13 +264,26 @@ def pass1_split_pages(
         # Strip running headers: "Chapter N | Title"
         cleaned = RE_RUNNING_HEADER_CHAPTER.sub("", cleaned)
 
-        # Strip running headers: "NNN Bates' Pocket Guide..." (with or without leading page number)
-        cleaned = re.sub(
-            r"^\s*\d*\s*Bates['\u2019]?\s*Pocket\s+Guide\s+to\s+Physical\s+Examination.*$",
-            "",
-            cleaned,
-            flags=re.MULTILINE,
-        )
+        # Strip book-specific running headers
+        book_name = meta.get("book", "").lower()
+        if "bates" in book_name:
+            # "NNN Bates' Pocket Guide..." (with or without leading page number)
+            cleaned = re.sub(
+                r"^\s*\d*\s*Bates['\u2019]?\s*Pocket\s+Guide\s+to\s+Physical\s+Examination.*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+        elif "harrison" in book_name:
+            # Harrison's running headers: "PART N  Section Title" or
+            # "CHAPTER NNN  Title" or page-number-only lines at page top.
+            # Exact patterns TBD after first OCR run — add specifics here.
+            cleaned = re.sub(
+                r"^\s*Harrison['\u2019]?s\s+Principles\s+of\s+Internal\s+Medicine.*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
 
         # Strip <header>C H A P T E R N</header> lines
         cleaned = RE_SPACED_CHAPTER.sub("", cleaned)
@@ -359,19 +372,29 @@ def pass2_assign_chapters(
     def find_chapter_by_book_page(book_page: int | None) -> dict[str, Any] | None:
         if book_page is None:
             return None
+        best: dict[str, Any] | None = None
         for entry in toc:
+            if entry.get("entry_type") != "chapter":
+                continue
             if (
                 entry["book_page_start"] is not None
                 and entry["book_page_start"] <= book_page <= entry["book_page_end"]
             ):
-                return entry
-        return None
+                # Prefer the deepest (most specific) matching entry.
+                # Higher level = narrower page range = more specific.
+                if best is None or entry.get("level", 1) > best.get("level", 1):
+                    best = entry
+        return best
 
     def find_chapter_by_pdf_page(pdf_page: int) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
         for entry in toc:
+            if entry.get("entry_type") != "chapter":
+                continue
             if entry["pdf_page_start"] <= pdf_page <= entry["pdf_page_end"]:
-                return entry
-        return None
+                if best is None or entry.get("level", 1) > best.get("level", 1):
+                    best = entry
+        return best
 
     def find_chapter(pdf_page: int, book_page: int | None) -> dict[str, Any] | None:
         if is_sample:
