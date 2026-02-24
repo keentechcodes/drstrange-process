@@ -93,6 +93,12 @@ else
         "pymupdf>=1.24.0" \
         "huggingface_hub>=0.20.0"
 
+    # Install Milvus ingestion dependencies
+    echo "[venv] Installing Milvus ingestion dependencies..."
+    uv pip install --python "$VENV_DIR/bin/python" \
+        "pymilvus>=2.5.0" \
+        "sentence-transformers>=3.0.0"
+
     # flash-attn for faster inference (~15-20% speedup)
     # Requires torch to be installed first; needs --no-build-isolation
     if command -v nvidia-smi &> /dev/null; then
@@ -120,6 +126,10 @@ try:
     print(f'  flash-attn: {flash_attn.__version__}')
 except ImportError:
     print('  flash-attn: NOT INSTALLED (will use SDPA)')
+import pymilvus
+print(f'  pymilvus: {pymilvus.__version__}')
+import sentence_transformers
+print(f'  sentence-transformers: {sentence_transformers.__version__}')
 "
 fi
 
@@ -151,7 +161,7 @@ echo ""
 echo "  Then run any script with python:"
 echo "    python extract_toc.py BATES.pdf"
 echo "    python run_docstrange_textbook.py BATES.pdf results/textbook"
-echo "    python run_docstrange_textbook.py BATES_sample_306-324.pdf results/sample --safe"
+echo "    python ingest_milvus.py results_book1/BATES.chunks.json"
 echo ""
 echo "  Pre-cached models:"
 echo "    $OCR_MODEL (Nanonets OCR2, Qwen2.5-VL-3B fine-tune)"
