@@ -346,12 +346,16 @@ STRICT RULES:
 
             def _enhanced_extract(self, image_path, max_new_tokens=None):
                 import time as _time
+                import os as _os
 
                 processor_self._page_counter["current"] += 1
                 n = processor_self._page_counter["current"]
                 total = processor_self._page_counter["total"]
 
-                print(f"[textbook]   Page {n}/{total}...", end="", flush=True)
+                chunk_label = _os.environ.get("DOCSTRANGE_CHUNK_LABEL", "")
+                prefix = f"[{chunk_label}] " if chunk_label else ""
+
+                print(f"[textbook] {prefix}Page {n}/{total}...", end="", flush=True)
                 t = _time.time()
 
                 try:

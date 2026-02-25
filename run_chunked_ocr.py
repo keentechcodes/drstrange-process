@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -137,6 +138,7 @@ def run_converter(
     output_dir: Path,
     meta_path: Path,
     extra_args: list[str] | None = None,
+    chunk_label: str = "",
 ) -> tuple[str | None, float]:
     """Run run_docstrange_textbook.py on a single chunk.
 
@@ -152,8 +154,12 @@ def run_converter(
     if extra_args:
         cmd.extend(extra_args)
 
+    env = os.environ.copy()
+    if chunk_label:
+        env["DOCSTRANGE_CHUNK_LABEL"] = chunk_label
+
     t0 = time.time()
-    result = subprocess.run(cmd, capture_output=False)
+    result = subprocess.run(cmd, capture_output=False, env=env)
     elapsed = time.time() - t0
 
     if result.returncode != 0:
@@ -254,12 +260,14 @@ def process_single_chunk(
     chunk_meta_path = chunk_output_dir / "meta.json"
     chunk_meta_path.write_text(json.dumps(chunk_meta, indent=2))
 
+    chunk_label = f"chunk_{chunk['chunk_num']:03d}"
     t0 = time.time()
     md_text, elapsed = run_converter(
         Path(chunk["path"]),
         chunk_output_dir,
         chunk_meta_path,
         extra_args=extra_args,
+        chunk_label=chunk_label,
     )
     total_elapsed = time.time() - t0
 
