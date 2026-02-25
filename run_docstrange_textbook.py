@@ -162,6 +162,88 @@ STRICT RULES:
         except ImportError:
             pass
 
+        # Optimization 0: Fix docling LayoutPredictor API compatibility
+        # Docling 2.3+ changed LayoutPredictor to not accept 'device' argument
+        # but docstrange 1.1.x still passes it. Wrap the init to ignore device.
+        # The class has moved across docling versions, so try multiple paths.
+        _layout_patched = False
+        for _layout_mod_path in (
+            "docling.models.layout.predictor",
+            "docling.models.layout_predictor",
+            "docling.models.layout.layout_predictor",
+        ):
+            try:
+                import importlib
+
+                layout_module = importlib.import_module(_layout_mod_path)
+                _lp_cls = getattr(layout_module, "LayoutPredictor", None)
+                if _lp_cls is None:
+                    continue
+
+                _original_layout_init = _lp_cls.__init__
+
+                def _patched_layout_init(
+                    self, *args, _orig=_original_layout_init, **kwargs
+                ):
+                    kwargs.pop("device", None)
+                    return _orig(self, *args, **kwargs)
+
+                _lp_cls.__init__ = _patched_layout_init
+                optimizations.append(f"layout_device_compat({_layout_mod_path})")
+                _layout_patched = True
+                break
+            except (ImportError, AttributeError):
+                continue
+
+        if not _layout_patched:
+            # Broad fallback: find LayoutPredictor anywhere in docling
+            try:
+                import docling
+
+                def _find_and_patch_layout_predictor(pkg, visited=None):
+                    """Recursively search docling for LayoutPredictor and patch it."""
+                    if visited is None:
+                        visited = set()
+                    import pkgutil
+
+                    pkg_path = getattr(pkg, "__path__", None)
+                    if pkg_path is None:
+                        return False
+                    for importer, modname, ispkg in pkgutil.walk_packages(
+                        pkg_path, prefix=pkg.__name__ + "."
+                    ):
+                        if modname in visited:
+                            continue
+                        visited.add(modname)
+                        try:
+                            mod = importlib.import_module(modname)
+                            cls = getattr(mod, "LayoutPredictor", None)
+                            if cls is not None and hasattr(cls, "__init__"):
+                                _orig_init = cls.__init__
+
+                                def _patched(self, *a, _oi=_orig_init, **kw):
+                                    kw.pop("device", None)
+                                    return _oi(self, *a, **kw)
+
+                                cls.__init__ = _patched
+                                print(
+                                    f"[textbook] Patched LayoutPredictor at {modname}"
+                                )
+                                return True
+                        except Exception:
+                            continue
+                    return False
+
+                if _find_and_patch_layout_predictor(docling):
+                    optimizations.append("layout_device_compat(scan)")
+                else:
+                    print(
+                        "[textbook] WARNING: Could not find LayoutPredictor to patch. "
+                        "If docling raises 'device' errors, pin docling<2.3."
+                    )
+            except ImportError:
+                pass
+
         # Optimization 1: Set DPI via InternalConfig (no monkey-patch needed)
         # Upstream default is 300; we respect --dpi CLI arg.
         # We do NOT override pdf_image_scale (upstream default 2.0 is correct).
