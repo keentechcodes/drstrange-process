@@ -102,18 +102,12 @@ else
         "pymilvus>=2.5.0" \
         "sentence-transformers>=3.0.0"
 
-    # flash-attn for faster inference (~15-20% speedup)
-    # Requires torch to be installed first; needs --no-build-isolation
-    if command -v nvidia-smi &> /dev/null; then
-        echo "[venv] Building flash-attn (this takes 5-15 minutes)..."
-        uv pip install --python "$VENV_DIR/bin/python" setuptools wheel psutil
-        if uv pip install --python "$VENV_DIR/bin/python" \
-            "flash-attn>=2.7.3" --no-build-isolation 2>&1 | tail -10; then
-            echo "[venv] flash-attn installed!"
-        else
-            echo "[venv] WARNING: flash-attn build failed. Will fall back to SDPA attention."
-        fi
-    fi
+    # Note: flash-attn is NOT installed here because:
+    # 1. Build often hangs/fails (requires compiling from source, 5-15 min)
+    # 2. Even when manually installed, often doesn't work due to CUDA version mismatches
+    # 3. The code in run_docstrange_textbook.py already falls back to SDPA which works fine
+    # If you really want flash-attn for ~15% speedup, install manually after setup:
+    #   pip install flash-attn --no-build-isolation
 
     # Verify installation
     echo "[venv] Verifying..."
@@ -124,11 +118,7 @@ import torch
 print(f'  torch: {torch.__version__} (CUDA: {torch.cuda.is_available()})')
 import fitz
 print(f'  pymupdf: {fitz.version}')
-try:
-    import flash_attn
-    print(f'  flash-attn: {flash_attn.__version__}')
-except ImportError:
-    print('  flash-attn: NOT INSTALLED (will use SDPA)')
+print('  flash-attn: NOT INSTALLED (using SDPA - ~15% slower but more stable)')
 import pymilvus
 print(f'  pymilvus: {pymilvus.__version__}')
 import sentence_transformers
