@@ -2,13 +2,17 @@
 """run_chunked_ocr.py — Run DocStrange OCR on large PDFs in page-range chunks.
 
 Splits a large PDF into smaller chunks (default 500 pages), runs the converter
-on each chunk sequentially to avoid OOM, then concatenates all markdown output
+on each chunk (optionally in parallel), then concatenates all markdown output
 into a single file.  This works around DocStrange loading all page images into
 RAM at once.
 
 Usage:
     python run_chunked_ocr.py HARRISONS21ST.pdf results_harrisons --meta-file harrisons21st.meta.json
     python run_chunked_ocr.py HARRISONS21ST.pdf results_harrisons --meta-file harrisons21st.meta.json --chunk-size 300
+    python run_chunked_ocr.py HARRISONS21ST.pdf results_harrisons --meta-file harrisons21st.meta.json --parallel 2
+
+The --parallel flag processes multiple chunks concurrently. Useful on GPUs with
+plenty of VRAM (each parallel worker loads the OCR model ~6GB).
 
 The output structure matches what run_docstrange_textbook.py produces:
     results_harrisons/HARRISONS21ST.md          (concatenated markdown)
@@ -25,12 +29,14 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from pathlib import Path
 
 import fitz  # PyMuPDF
 
 
 DEFAULT_CHUNK_SIZE = 500  # pages per chunk
+DEFAULT_PARALLEL = 1  # number of chunks to process concurrently
 
 
 def split_pdf(
@@ -209,6 +215,63 @@ def concatenate_markdown(
     return "\n\n".join(parts) + "\n"
 
 
+def process_single_chunk(
+    chunk: dict,
+    output_dir: Path,
+    original_meta: dict,
+    original_offset: int,
+    extra_args: list[str],
+    start_chunk: int,
+) -> tuple[int, str | None, float]:
+    """Process a single chunk - designed to run in parallel.
+
+    Returns (chunk_num, markdown_text or None, elapsed_seconds).
+    """
+    chunk_num = chunk["chunk_num"]
+
+    if chunk_num < start_chunk:
+        print(f"[chunked-ocr] Chunk {chunk_num}: skipping (before --start-chunk)")
+        chunk_output_dir = output_dir / f"chunk_{chunk_num:03d}"
+        md_files = (
+            list(chunk_output_dir.glob("*.md")) if chunk_output_dir.exists() else []
+        )
+        if md_files:
+            cached_md = md_files[0].read_text(encoding="utf-8")
+            cached_md = renumber_chunk_pages(
+                cached_md, chunk["pdf_start"], original_offset
+            )
+            return (chunk_num, cached_md, 0.0)
+        return (chunk_num, None, 0.0)
+
+    print(
+        f"[chunked-ocr] Chunk {chunk_num}: starting (pages {chunk['pdf_start']}-{chunk['pdf_end']})"
+    )
+
+    chunk_output_dir = output_dir / f"chunk_{chunk_num:03d}"
+    chunk_output_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_meta = create_chunk_meta(original_meta, chunk)
+    chunk_meta_path = chunk_output_dir / "meta.json"
+    chunk_meta_path.write_text(json.dumps(chunk_meta, indent=2))
+
+    t0 = time.time()
+    md_text, elapsed = run_converter(
+        Path(chunk["path"]),
+        chunk_output_dir,
+        chunk_meta_path,
+        extra_args=extra_args,
+    )
+    total_elapsed = time.time() - t0
+
+    if md_text:
+        md_text = renumber_chunk_pages(md_text, chunk["pdf_start"], original_offset)
+        print(f"[chunked-ocr] Chunk {chunk_num}: done in {total_elapsed:.0f}s")
+        return (chunk_num, md_text, total_elapsed)
+    else:
+        print(f"[chunked-ocr] Chunk {chunk_num}: WARNING - no output")
+        return (chunk_num, None, total_elapsed)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run DocStrange OCR on large PDFs in page-range chunks.",
@@ -238,6 +301,12 @@ def main():
         nargs="*",
         default=[],
         help="Extra args to pass to run_docstrange_textbook.py (e.g. --safe --dpi=200)",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=DEFAULT_PARALLEL,
+        help=f"Number of chunks to process in parallel (default: {DEFAULT_PARALLEL})",
     )
     args = parser.parse_args()
 
@@ -272,60 +341,92 @@ def main():
     split_time = time.time() - t0
     print(f"[chunked-ocr] Split completed in {split_time:.1f}s")
 
-    # Phase 2: Run converter on each chunk
-    print(f"\n[chunked-ocr] === Phase 2: Running OCR ({len(chunks)} chunks) ===")
+    # Phase 2: Run converter on each chunk (potentially in parallel)
+    print(
+        f"\n[chunked-ocr] === Phase 2: Running OCR ({len(chunks)} chunks, parallel={args.parallel}) ==="
+    )
     chunk_markdowns: list[tuple[int, str]] = []
     total_elapsed = 0.0
-    chunks_completed = 0
 
-    for chunk in chunks:
+    # Filter chunks to process (respect --start-chunk)
+    chunks_to_process = [c for c in chunks if c["chunk_num"] >= args.start_chunk]
+    chunks_skipped = [c for c in chunks if c["chunk_num"] < args.start_chunk]
+
+    # Load skipped chunks from cache
+    for chunk in chunks_skipped:
         chunk_num = chunk["chunk_num"]
-
-        if chunk_num < args.start_chunk:
-            print(
-                f"[chunked-ocr] Skipping chunk {chunk_num} (--start-chunk={args.start_chunk})"
-            )
-            # Try to load existing output for skipped chunks
-            chunk_output_dir = args.output_dir / f"chunk_{chunk_num:03d}"
-            md_files = (
-                list(chunk_output_dir.glob("*.md")) if chunk_output_dir.exists() else []
-            )
-            if md_files:
-                cached_md = md_files[0].read_text(encoding="utf-8")
-                cached_md = renumber_chunk_pages(
-                    cached_md, chunk["pdf_start"], original_offset
-                )
-                chunk_markdowns.append((chunk_num, cached_md))
-            continue
-
-        print(
-            f"\n[chunked-ocr] --- Chunk {chunk_num}/{len(chunks)} "
-            f"(pages {chunk['pdf_start']}-{chunk['pdf_end']}, {chunk['pages']} pages) ---"
-        )
-
-        # Create chunk-specific output dir and meta
+        print(f"[chunked-ocr] Chunk {chunk_num}: skipping (before --start-chunk)")
         chunk_output_dir = args.output_dir / f"chunk_{chunk_num:03d}"
-        chunk_output_dir.mkdir(parents=True, exist_ok=True)
-
-        chunk_meta = create_chunk_meta(original_meta, chunk)
-        chunk_meta_path = chunk_output_dir / "meta.json"
-        chunk_meta_path.write_text(json.dumps(chunk_meta, indent=2))
-
-        # Run converter
-        md_text, elapsed = run_converter(
-            Path(chunk["path"]),
-            chunk_output_dir,
-            chunk_meta_path,
-            extra_args=args.converter_args,
+        md_files = (
+            list(chunk_output_dir.glob("*.md")) if chunk_output_dir.exists() else []
         )
+        if md_files:
+            cached_md = md_files[0].read_text(encoding="utf-8")
+            cached_md = renumber_chunk_pages(
+                cached_md, chunk["pdf_start"], original_offset
+            )
+            chunk_markdowns.append((chunk_num, cached_md))
 
-        total_elapsed += elapsed
-        chunks_completed += 1
+    if args.parallel > 1:
+        # Parallel processing using ProcessPoolExecutor
+        # Each worker needs its own process, so we use spawn
+        # Note: Each chunk loads the OCR model (~6GB VRAM), so parallel workers
+        # compete for GPU memory. Start with --parallel=2 and monitor VRAM.
+        max_workers = min(args.parallel, len(chunks_to_process))
+        print(f"[chunked-ocr] Running {max_workers} chunks in parallel...")
 
-        if md_text:
-            md_text = renumber_chunk_pages(md_text, chunk["pdf_start"], original_offset)
-            chunk_markdowns.append((chunk_num, md_text))
-            pages_done = sum(c["pages"] for c in chunks[:chunk_num])
+        # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid CUDA fork issues
+        # Threads share the same GPU context, which is fine for this use case
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    process_single_chunk,
+                    chunk,
+                    args.output_dir,
+                    original_meta,
+                    original_offset,
+                    args.converter_args,
+                    args.start_chunk,
+                ): chunk
+                for chunk in chunks_to_process
+            }
+
+            for future in as_completed(futures):
+                chunk_num, md_text, elapsed = future.result()
+                total_elapsed += elapsed
+                if md_text:
+                    chunk_markdowns.append((chunk_num, md_text))
+
+                # Print progress
+                done = len(chunk_markdowns)
+                total = len(chunks)
+                total_pages = sum(c["pages"] for c in chunks)
+                pages_done = sum(
+                    c["pages"] for c in chunks if c["chunk_num"] <= chunk_num
+                )
+                rate = pages_done / total_elapsed if total_elapsed > 0 else 0
+                eta_remaining = (total_pages - pages_done) / rate if rate > 0 else 0
+                print(
+                    f"[chunked-ocr] Progress: {done}/{total} chunks, "
+                    f"{pages_done}/{total_pages} pages, "
+                    f"ETA: {eta_remaining / 3600:.1f}h"
+                )
+    else:
+        # Sequential processing (original behavior)
+        for chunk in chunks_to_process:
+            chunk_num, md_text, elapsed = process_single_chunk(
+                chunk,
+                args.output_dir,
+                original_meta,
+                original_offset,
+                args.converter_args,
+                args.start_chunk,
+            )
+            total_elapsed += elapsed
+            if md_text:
+                chunk_markdowns.append((chunk_num, md_text))
+
+            pages_done = sum(c["pages"] for c in chunks_to_process[:chunk_num])
             total_pages = sum(c["pages"] for c in chunks)
             rate = pages_done / total_elapsed if total_elapsed > 0 else 0
             eta_remaining = (total_pages - pages_done) / rate if rate > 0 else 0
@@ -334,8 +435,6 @@ def main():
                 f"({pages_done}/{total_pages} pages, "
                 f"ETA: {eta_remaining / 3600:.1f}h remaining)"
             )
-        else:
-            print(f"[chunked-ocr] WARNING: Chunk {chunk_num} produced no output")
 
     # Phase 3: Concatenate
     print(
