@@ -163,64 +163,87 @@ STRICT RULES:
             pass
 
         # Optimization 0: Fix docling LayoutPredictor API compatibility
-        # Docling 2.3+ removed the 'device' kwarg from LayoutPredictor.__init__()
-        # but docstrange's NeuralDocumentProcessor._initialize_docling_models still
-        # passes it.  Patch _initialize_docling_models to catch the TypeError and
-        # retry without 'device'.
+        # Docling 2.3+ (and newer docstrange) removed the 'device' kwarg from
+        # LayoutPredictor.__init__() but docstrange's NeuralDocumentProcessor
+        # still passes it. Patch at multiple levels to ensure compatibility.
         #
         # Traceback on affected versions:
         #   neural_document_processor.py:227 in _initialize_docling_models
         #     self.layout_predictor = LayoutPredictor(device=..., ...)
         #   TypeError: LayoutPredictor.__init__() got unexpected keyword argument 'device'
+
+        # Strategy: Pre-emptively patch LayoutPredictor at the docling-ibm-models
+        # source level before docstrange imports it. This handles all code paths.
+        _layout_predictor_patched = False
         try:
-            import docstrange.pipeline.neural_document_processor as ndp_module
+            from docling_ibm_models import layout_predictor as lp_module
 
-            _NDP = ndp_module.NeuralDocumentProcessor
-            _orig_init_docling = _NDP._initialize_docling_models
+            _lp_original_init = getattr(lp_module.LayoutPredictor, "__init__", None)
+            if _lp_original_init is not None:
 
-            def _patched_init_docling(self_inner):
-                try:
-                    return _orig_init_docling(self_inner)
-                except TypeError as e:
-                    if "device" not in str(e):
-                        raise
-                    # LayoutPredictor no longer accepts 'device' — find and
-                    # monkey-patch it at the source, then retry.
-                    # The LayoutPredictor class is imported in the module's
-                    # global scope; patch its __init__ to drop 'device'.
-                    _lp_cls = getattr(ndp_module, "LayoutPredictor", None)
-                    if _lp_cls is None:
-                        # LayoutPredictor may be a local import; scan the
-                        # module's namespace for the class that raised.
-                        for attr_name in dir(ndp_module):
-                            obj = getattr(ndp_module, attr_name)
-                            if (
-                                isinstance(obj, type)
-                                and "LayoutPredictor" in obj.__name__
-                            ):
-                                _lp_cls = obj
-                                break
-                    if _lp_cls is not None:
-                        _orig_lp_init = _lp_cls.__init__
+                def _lp_init_strip_device(
+                    self_lp, *args, _orig=_lp_original_init, **kwargs
+                ):
+                    kwargs.pop("device", None)
+                    return _orig(self_lp, *args, **kwargs)
 
-                        def _lp_init_no_device(self_lp, *a, _oi=_orig_lp_init, **kw):
-                            kw.pop("device", None)
-                            return _oi(self_lp, *a, **kw)
+                lp_module.LayoutPredictor.__init__ = _lp_init_strip_device
+                _layout_predictor_patched = True
+                print(
+                    f"[textbook] Pre-patched docling_ibm_models.LayoutPredictor to strip 'device' kwarg"
+                )
+        except ImportError:
+            pass
 
-                        _lp_cls.__init__ = _lp_init_no_device
-                        print(
-                            f"[textbook] Patched {_lp_cls.__module__}.{_lp_cls.__name__}"
-                            " to remove 'device' kwarg"
-                        )
+        # Also patch NeuralDocumentProcessor._initialize_docling_models as backup
+        if not _layout_predictor_patched:
+            try:
+                import docstrange.pipeline.neural_document_processor as ndp_module
+
+                _NDP = ndp_module.NeuralDocumentProcessor
+                _orig_init_docling = _NDP._initialize_docling_models
+
+                def _patched_init_docling(self_inner):
+                    try:
                         return _orig_init_docling(self_inner)
-                    raise  # re-raise if we couldn't find the class
+                    except TypeError as e:
+                        if "device" not in str(e):
+                            raise
+                        # LayoutPredictor no longer accepts 'device' — find and
+                        # monkey-patch it at the source, then retry.
+                        _lp_cls = getattr(ndp_module, "LayoutPredictor", None)
+                        if _lp_cls is None:
+                            for attr_name in dir(ndp_module):
+                                obj = getattr(ndp_module, attr_name)
+                                if (
+                                    isinstance(obj, type)
+                                    and "LayoutPredictor" in obj.__name__
+                                ):
+                                    _lp_cls = obj
+                                    break
+                        if _lp_cls is not None:
+                            _orig_lp_init = _lp_cls.__init__
 
-            _NDP._initialize_docling_models = _patched_init_docling
-            optimizations.append("layout_device_compat")
-        except (ImportError, AttributeError) as e:
-            print(
-                f"[textbook] WARNING: Could not patch _initialize_docling_models: {e}"
-            )
+                            def _lp_init_no_device(
+                                self_lp, *a, _oi=_orig_lp_init, **kw
+                            ):
+                                kw.pop("device", None)
+                                return _oi(self_lp, *a, **kw)
+
+                            _lp_cls.__init__ = _lp_init_no_device
+                            print(
+                                f"[textbook] Patched {_lp_cls.__module__}.{_lp_cls.__name__}"
+                                " to remove 'device' kwarg"
+                            )
+                            return _orig_init_docling(self_inner)
+                        raise
+
+                _NDP._initialize_docling_models = _patched_init_docling
+                optimizations.append("layout_device_compat")
+            except (ImportError, AttributeError) as e:
+                print(
+                    f"[textbook] WARNING: Could not patch _initialize_docling_models: {e}"
+                )
 
         # Optimization 1: Set DPI via InternalConfig (no monkey-patch needed)
         # Upstream default is 300; we respect --dpi CLI arg.

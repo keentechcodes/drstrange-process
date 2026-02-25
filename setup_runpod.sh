@@ -85,9 +85,12 @@ else
         "torchvision>=0.15.0"
 
     # Install docstrange + all pipeline dependencies
+    # NOTE: Pin exact versions to avoid API breaking changes between releases.
+    # Check what version works on your RTX 4000 pod with: pip show docstrange docling-ibm-models
     echo "[venv] Installing docstrange and pipeline dependencies..."
     uv pip install --python "$VENV_DIR/bin/python" \
-        "docstrange>=1.1.0" \
+        "docstrange==1.1.8" \
+        "docling-ibm-models==3.11.0" \
         "pdf2image>=1.17.0" \
         "Pillow>=10.0.0" \
         "pymupdf>=1.24.0" \
