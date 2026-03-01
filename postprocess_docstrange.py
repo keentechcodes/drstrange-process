@@ -258,8 +258,11 @@ def pass1_split_pages(
         # Strip stray </table> at start of page (from converter force-close)
         cleaned = re.sub(r"^\s*</table>\s*", "", cleaned)
 
-        # Strip <page_number> tags (we already extracted the values)
+        # Strip <page_number> tags (we already extracted the numeric values above).
+        # First strip the numeric-only tags, then strip ALL remaining <page_number>
+        # tags (which may contain timestamps, HPIM filenames, chapter headers, etc.)
         cleaned = RE_PAGE_NUMBER_TAG.sub("", cleaned)
+        cleaned = re.sub(r"<page_number>.*?</page_number>", "", cleaned)
 
         # Strip running headers: "Chapter N | Title"
         cleaned = RE_RUNNING_HEADER_CHAPTER.sub("", cleaned)
@@ -275,9 +278,102 @@ def pass1_split_pages(
                 flags=re.MULTILINE,
             )
         elif "harrison" in book_name:
-            # Harrison's running headers: "PART N  Section Title" or
-            # "CHAPTER NNN  Title" or page-number-only lines at page top.
-            # Exact patterns TBD after first OCR run — add specifics here.
+            # Harrison's running headers (identified from OCR output analysis).
+
+            # 1. HPIM21e InDesign filename footers (2,900+ occurrences):
+            #    "HPIM21e_Part4_p481-p940.indd 653"
+            #    "HPIM21e_Part13_p3578.indd 3285" (single-page variant)
+            cleaned = re.sub(
+                r"^.*HPIM21e_Part\d+_p[\d\-p]+\.indd\s+\d+.*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+
+            # 2. Print timestamps (2,888+ occurrences):
+            #    "20/01/22 3:24 PM", "21/01/22 7:50 AM"
+            #    Also catches bold-wrapped: "**21/01/22 3:38 PM**"
+            cleaned = re.sub(
+                r"^\s*\*{0,2}\d{2}/\d{2}/\d{2}\s+\d{1,2}:\d{2}\s*(?:AM|PM)\*{0,2}\s*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+
+            # 3. AFKEBOOKS watermark (2,083+ occurrences in ~15 formats):
+            #    Any line containing "AFKEBOOKS" and standalone "SINCE 2013"
+            cleaned = re.sub(
+                r"^.*AFKEBOOKS.*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+            cleaned = re.sub(
+                r"^\s*SINCE\s+2013\s*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+
+            # 4. Bare "PART N" running headers (1,081 occurrences):
+            #    Even-page running header "PART 4" or "**PART 4**"
+            #    followed by section name on next line
+            _HARRISON_SECTIONS = (
+                "The Profession of Medicine",
+                "Cardinal Manifestations and Presentation of Diseases",
+                "Genes, the Environment, and Disease",
+                "Oncology and Hematology",
+                "Infectious Diseases",
+                "Disorders of the Cardiovascular System",
+                "Disorders of the Respiratory System",
+                "Critical Care Medicine",
+                "Disorders of the Kidney and Urinary Tract",
+                "Disorders of the Gastrointestinal System",
+                "Immune-Mediated, Inflammatory, and Rheumatologic Disorders",
+                "Endocrinology and Metabolism",
+                "Neurologic Disorders",
+                "Poisoning, Drug Overdose, and Envenomation",
+                "Disorders of the Eyes, Ears, Nose, and Throat",
+                "Disorders of the Skin",
+                "Nutrition and Obesity",
+                "Aging",
+                "Consultative Medicine",
+                "Frontiers",
+            )
+            # Strip bare "PART N" lines (with optional bold)
+            cleaned = re.sub(
+                r"^\s*\*{0,2}PART\s+\d+\*{0,2}\s*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+            # Strip section name lines when standalone (running headers)
+            for section_name in _HARRISON_SECTIONS:
+                cleaned = re.sub(
+                    r"^\s*\*{0,2}" + re.escape(section_name) + r"\*{0,2}\s*$",
+                    "",
+                    cleaned,
+                    flags=re.MULTILINE,
+                )
+
+            # 5. CHAPTER N running headers (288 occurrences):
+            #    Odd-page running header "CHAPTER 202" (bare, no title)
+            cleaned = re.sub(
+                r"^\s*CHAPTER\s+\d+\s*$",
+                "",
+                cleaned,
+                flags=re.MULTILINE,
+            )
+
+            # 6. <footer> tags (903 occurrences)
+            cleaned = re.sub(
+                r"<footer>.*?</footer>",
+                "",
+                cleaned,
+                flags=re.DOTALL,
+            )
+
+            # 7. Harrison's book title running header
             cleaned = re.sub(
                 r"^\s*Harrison['\u2019]?s\s+Principles\s+of\s+Internal\s+Medicine.*$",
                 "",

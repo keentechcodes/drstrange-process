@@ -21,9 +21,13 @@ ENV/
 *.toc.json
 *.meta.json
 *.pageblocks.json
+*.chunks.json
 results/
+results_*/
+results0/
 images/
 data/
+docs/
 
 # OS
 .DS_Store

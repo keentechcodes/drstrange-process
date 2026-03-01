@@ -180,12 +180,14 @@ def renumber_chunk_pages(
     original_pdf_start: int,
     original_offset: int,
 ) -> str:
-    """Re-number ``## Page N`` headers from chunk-relative to book-relative.
+    """Re-number ``# Page N`` and ``## Page N`` headers from chunk-relative to book-relative.
 
     The converter produces chunk-relative page numbers (``## Page 1`` is the
     first page of the chunk).  This function shifts them so that
     ``## Page 1`` in a chunk starting at original PDF page *S* with book
     offset *O* becomes ``## Page (S - O)``.
+
+    Both ``# Page N`` (h1) and ``## Page N`` (h2) markers are renumbered.
 
     Example — Harrison's chunk 2, original PDF pages 542–1041, offset 41:
         ## Page 1  →  ## Page 501   (542 - 41 = 501)
@@ -200,10 +202,35 @@ def renumber_chunk_pages(
         return md_text  # chunk 1 for content starting at page 1: no shift needed
 
     def _shift(match: re.Match) -> str:
-        old_num = int(match.group(1))
-        return f"## Page {old_num + shift}"
+        hashes = match.group(1)
+        old_num = int(match.group(2))
+        return f"{hashes} Page {old_num + shift}"
 
-    return re.sub(r"^## Page (\d+)", _shift, md_text, flags=re.MULTILINE)
+    # Match both # Page N and ## Page N at line start
+    return re.sub(r"^(#{1,2}) Page (\d+)", _shift, md_text, flags=re.MULTILINE)
+
+
+def add_image_prefix(md_text: str, chunk_num: int) -> str:
+    """Prefix image paths with chunk number for collision avoidance.
+
+    When images from multiple chunks are collected into a single directory,
+    filenames can collide (e.g., both chunk 1 and chunk 2 may produce
+    ``page1_img1.png``).  Image files are renamed with ``c{NNN}_`` prefix
+    during collection; this function updates the markdown references to match.
+
+    Transforms:
+        ``![alt](images/page31_img2.png)`` → ``![alt](images/c001_page31_img2.png)``
+    """
+    prefix = f"c{chunk_num:03d}_"
+
+    # Fix markdown image syntax: ![...](images/filename)
+    md_text = re.sub(
+        r"!\[([^\]]*)\]\(images/([^)]+)\)",
+        lambda m: f"![{m.group(1)}](images/{prefix}{m.group(2)})",
+        md_text,
+    )
+
+    return md_text
 
 
 def concatenate_markdown(
@@ -212,9 +239,13 @@ def concatenate_markdown(
     """Concatenate chunk markdowns into a single document.
 
     Each chunk's markdown has already been renumbered to book page numbers.
+    Chunks are sorted by chunk_num to ensure correct ordering regardless
+    of completion order (important when using parallel processing).
     """
+    # Sort by chunk_num to guarantee correct page order
+    chunk_markdowns_sorted = sorted(chunk_markdowns, key=lambda x: x[0])
     parts = []
-    for chunk_num, md in chunk_markdowns:
+    for chunk_num, md in chunk_markdowns_sorted:
         if md:
             parts.append(md.rstrip())
 
@@ -246,6 +277,7 @@ def process_single_chunk(
             cached_md = renumber_chunk_pages(
                 cached_md, chunk["pdf_start"], original_offset
             )
+            cached_md = add_image_prefix(cached_md, chunk_num)
             return (chunk_num, cached_md, 0.0)
         return (chunk_num, None, 0.0)
 
@@ -273,6 +305,7 @@ def process_single_chunk(
 
     if md_text:
         md_text = renumber_chunk_pages(md_text, chunk["pdf_start"], original_offset)
+        md_text = add_image_prefix(md_text, chunk_num)
         print(f"[chunked-ocr] Chunk {chunk_num}: done in {total_elapsed:.0f}s")
         return (chunk_num, md_text, total_elapsed)
     else:
@@ -373,6 +406,7 @@ def main():
             cached_md = renumber_chunk_pages(
                 cached_md, chunk["pdf_start"], original_offset
             )
+            cached_md = add_image_prefix(cached_md, chunk_num)
             chunk_markdowns.append((chunk_num, cached_md))
 
     if args.parallel > 1:
