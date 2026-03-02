@@ -104,6 +104,23 @@ python pipeline/ingest_milvus.py \
 
 Use `--recreate` on the ingest step to drop and recreate the collection. Use `--embed-cache` to avoid recomputing embeddings on retries (~42 min saved).
 
+## Tests
+
+98 unit tests covering all pipeline modules. No GPU or Zilliz credentials needed -- tests exercise pure-logic functions only.
+
+```bash
+python -m pytest tests/ -v
+```
+
+| Module | Tests | Covers |
+|--------|-------|--------|
+| `test_postprocess.py` | 17 | `make_raw_page_block`, `_pass0_pre_clean`, `pass1_split_pages`, `_detect_is_sample`, `_assess_confidence` |
+| `test_chunk_textbook.py` | 21 | `split_sentences`, `split_list_items`, `count_tokens`, `make_chunk`, `chunk_atomic` |
+| `test_run_chunked_ocr.py` | 17 | `renumber_chunk_pages`, `add_image_prefix`, `concatenate_markdown`, `create_chunk_meta` |
+| `test_run_docstrange.py` | 15 | `_normalize_headings`, `_validate_page_content`, `_replace_img_tags`, `_clean_output`, `_renumber_pages` |
+| `test_extract_toc.py` | 13 | `_parse_chapter_num`, `_classify_entry`, `detect_page_offset_from_anchors`, `detect_page_offset_from_toc` |
+| `test_ingest_milvus.py` | 15 | `_load_env`, `_get_env`, `trunc` (byte-aware VARCHAR truncation) |
+
 ## Project Structure
 
 ```
@@ -114,6 +131,15 @@ pipeline/                               # Core 5-stage pipeline
   postprocess_docstrange.py             #   Stage 2: 7-pass postprocessor
   chunk_textbook.py                     #   Stage 3: Content-type-aware chunking
   ingest_milvus.py                      #   Stage 4: Embedding + Zilliz insertion
+
+tests/                                  # Unit tests (98 tests, no GPU needed)
+  conftest.py                           #   Shared fixtures
+  test_postprocess.py                   #   Postprocessor tests
+  test_chunk_textbook.py                #   Chunking logic tests
+  test_run_chunked_ocr.py               #   Chunked OCR helper tests
+  test_run_docstrange.py                #   OCR processor tests
+  test_extract_toc.py                   #   TOC extraction tests
+  test_ingest_milvus.py                 #   Ingestion utility tests
 
 scripts/                                # Utilities
   setup_runpod.sh                       #   RunPod GPU environment setup
