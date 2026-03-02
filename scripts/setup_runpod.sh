@@ -13,8 +13,8 @@
 #
 # After setup, activate the venv and run any script with plain `python`:
 #   source .venv/bin/activate
-#   python extract_toc.py BATES.pdf
-#   python run_docstrange_textbook.py BATES.pdf results/textbook
+#   python pipeline/extract_toc.py BATES.pdf
+#   python pipeline/run_docstrange_textbook.py BATES.pdf results/textbook
 
 set -euo pipefail
 
@@ -105,7 +105,7 @@ else
     # Note: flash-attn is NOT installed here because:
     # 1. Build often hangs/fails (requires compiling from source, 5-15 min)
     # 2. Even when manually installed, often doesn't work due to CUDA version mismatches
-    # 3. The code in run_docstrange_textbook.py already falls back to SDPA which works fine
+    # 3. The code in pipeline/run_docstrange_textbook.py already falls back to SDPA which works fine
     # If you really want flash-attn for ~15% speedup, install manually after setup:
     #   pip install flash-attn --no-build-isolation
 
@@ -151,10 +151,10 @@ echo ""
 echo "  Activate the environment:"
 echo "    source .venv/bin/activate"
 echo ""
-echo "  Then run any script with python:"
-echo "    python extract_toc.py BATES.pdf"
-echo "    python run_docstrange_textbook.py BATES.pdf results/textbook"
-echo "    python ingest_milvus.py results_book1/BATES.chunks.json"
+echo "  Then run pipeline scripts with python:"
+echo "    python pipeline/extract_toc.py BATES.pdf"
+echo "    python pipeline/run_docstrange_textbook.py BATES.pdf results/textbook"
+echo "    python pipeline/ingest_milvus.py results_book1/BATES.chunks.json"
 echo ""
 echo "  Pre-cached models:"
 echo "    $OCR_MODEL (Nanonets OCR2, Qwen2.5-VL-3B fine-tune)"

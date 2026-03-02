@@ -65,7 +65,8 @@ TEXT_MAX_LENGTH = 65535
 
 def load_env() -> None:
     """Load .env file if present (no dependency on python-dotenv)."""
-    env_path = Path(__file__).parent / ".env"
+    # .env lives in repo root (parent of pipeline/)
+    env_path = Path(__file__).resolve().parent.parent / ".env"
     if not env_path.exists():
         return
     for line in env_path.read_text().splitlines():
